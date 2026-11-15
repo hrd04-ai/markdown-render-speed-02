@@ -202,7 +202,10 @@ function resolveEscapes(s) {
 // Normalize a link reference label: resolve escapes, collapse all whitespace
 // runs (incl. newlines/tabs) to single spaces, trim, case-fold.
 function normalizeLabel(raw) {
-  return resolveEscapes(raw).replace(/\s+/g, ' ').trim().toLowerCase();
+  // Labels match on RAW text (backslashes preserved: [foo\!] != [foo!]).
+  // Unicode case folding: ß/ẞ fold to 'ss', final sigma ς folds to σ.
+  return raw.replace(/\s+/g, ' ').trim().toLowerCase()
+    .replace(/\u00df/g, 'ss').replace(/\u03c2/g, '\u03c3');
 }
 
 // ---------------------------------------------------------------------------
@@ -536,12 +539,15 @@ function matchHtmlBlock(t) {
     }
   }
   // Type 7: a complete open or close tag alone on the line, with a tag
-  // name that is NOT a block tag.
-  const mTag = /^<\/?([A-Za-z][A-Za-z0-9-]*)(\s[^>]*)?\/?>/.exec(rest);
-  if (mTag) {
-    let after = i + mTag[0].length;
+  // name that is NOT a block tag. Validated with the strict inline tag
+  // matcher (attribute names/values must be well-formed: no attributes
+  // on closing tags, whitespace required between attributes).
+  const tagEnd = matchInlineTag(rest, 0);
+  if (tagEnd !== -1) {
+    const mName = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
+    let after = i + tagEnd;
     while (after < t.length && isSpaceOrTab(t[after])) after++;
-    if (after >= t.length && !BLOCK_TAGS.has(mTag[1].toLowerCase())) {
+    if (after >= t.length && mName && !BLOCK_TAGS.has(mName[1].toLowerCase())) {
       return { type: 7, end: null };
     }
   }
@@ -807,6 +813,9 @@ function parseLinkDef(text) {
   while (i < n) {
     const c = text[i];
     if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
+      // Escapes are kept RAW in the label (for matching); a \] does not
+      // end the label, a \[ does not invalidate it.
+      label += text[i];
       label += text[i + 1];
       i += 2;
     } else if (c === '[') return null;
@@ -916,14 +925,16 @@ function parseLinkDef(text) {
 // ---------------------------------------------------------------------------
 
 // Can this line start a block that interrupts a paragraph?
-function interruptsParagraph(t) {
+function interruptsParagraph(t, inListItem) {
   if (matchFence(t) || matchATX(t) || matchHR(t)) return true;
   if (matchBlockquote(t) !== null) return true;
   const hm = matchHtmlBlock(t);
   if (hm && hm.type <= 6) return true;
   const lm = matchListMarker(t);
   // An empty list item (marker with no content) cannot interrupt a paragraph.
-  if (lm && !lm.empty && (!lm.ordered || lm.start === 1)) return true;
+  // Inside a list item's content, ANY list interrupts (no start-with-1
+  // restriction); elsewhere an ordered list must start with 1.
+  if (lm && !lm.empty && (!lm.ordered || lm.start === 1 || inListItem)) return true;
   return false;
 }
 
@@ -943,7 +954,7 @@ function isTableBodyRow(t) {
 
 // Consume a paragraph starting at lines[i]. Handles setext headings, table
 // formation, and leading link reference definitions. Returns {blocks, next}.
-function consumeParagraph(lines, i, refs) {
+function consumeParagraph(lines, i, refs, inListItem) {
   const paraLines = [lines[i].t];
   let j = i + 1;
   let endKind = 'blank';
@@ -962,7 +973,7 @@ function consumeParagraph(lines, i, refs) {
     if (aligns) { endKind = 'table'; tableAlign = aligns; break; }
     const sx = L.noSetext ? 0 : matchSetext(t);
     if (sx) { endKind = 'setext'; setextLevel = sx; break; }
-    if (interruptsParagraph(t)) { endKind = 'interrupt'; break; }
+    if (interruptsParagraph(t, inListItem)) { endKind = 'interrupt'; break; }
     paraLines.push(t);
     j++;
   }
@@ -1178,7 +1189,7 @@ function collectItem(lines, j, m, refs) {
     if (matchListMarker(t)) break;
     if (!isLazyAble(t)) break;
     if (needCheck) {
-      const blocks = parseBlocks(itemLines, new Map());
+      const blocks = parseBlocks(itemLines, new Map(), true);
       const lastBlank = itemLines.length > 0 && isBlankLine(itemLines[itemLines.length - 1]);
       paraOpen = endsWithOpenParagraph(blocks, lastBlank);
       needCheck = false;
@@ -1192,7 +1203,7 @@ function collectItem(lines, j, m, refs) {
     k++;
   }
   if (itemLines.length > 0) itemLines[itemLines.length - 1].nl = false;
-  const children = parseBlocks(itemLines, refs);
+  const children = parseBlocks(itemLines, refs, true);
   // Item looseness: a blank line DIRECTLY between two top-level children
   // (blank lines inside a nested block do not count).
   const itemLoose = children.hasBlankBetween === true;
@@ -1262,7 +1273,7 @@ function consumeList(lines, i, refs) {
 // Main block parser
 // ---------------------------------------------------------------------------
 
-function parseBlocks(lines, refs) {
+function parseBlocks(lines, refs, inListItem) {
   const blocks = [];
   blocks.hasBlankBetween = false;
   let i = 0;
@@ -1284,7 +1295,7 @@ function parseBlocks(lines, refs) {
     // A lazy continuation line is paragraph text, never a new block
     // (even if stripping made it look like a list marker or heading).
     if (L.lazy) {
-      const r = consumeParagraph(lines, i, refs);
+      const r = consumeParagraph(lines, i, refs, inListItem);
       for (const b of r.blocks) pushBlock(b);
       if (r.blocks.length === 0 && blankSinceLastBlock) {
         blocks.hasBlankBetween = true;
@@ -1338,7 +1349,7 @@ function parseBlocks(lines, refs) {
       i = r.next;
       continue;
     }
-    const r = consumeParagraph(lines, i, refs);
+    const r = consumeParagraph(lines, i, refs, inListItem);
     for (const b of r.blocks) pushBlock(b);
     if (r.blocks.length === 0 && blankSinceLastBlock) {
       blocks.hasBlankBetween = true;
@@ -1382,6 +1393,7 @@ function matchInlineTag(text, i) {
       if (isAlpha(c) || isDigit(c) || c === '_' || c === '.' || c === ':' || c === '-') j++;
       else break;
     }
+    const afterName = j;
     while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
     if (j < n && text[j] === '=') {
       j++;
@@ -1403,6 +1415,10 @@ function matchInlineTag(text, i) {
         }
         if (j === vs) return -1;
       }
+    } else {
+      // Boolean attribute (no '='): restore j so the whitespace stays
+      // for the next iteration's separator check.
+      j = afterName;
     }
   }
 }
@@ -1632,6 +1648,41 @@ function matchExtendedUrl(text, i) {
     }
     return null;
   }
+  // xmpp: (lowercase only, preceding char must not be a word char).
+  // Email right after, plus an optional path: '/' + [A-Za-z0-9.@]+
+  // with trailing '.'s trimmed. (The only other scheme+email autolink.)
+  if (text.startsWith('xmpp:', i)) {
+    const prev = i === 0 ? '' : text[i - 1];
+    if (i === 0 || !isWordChar(prev)) {
+      let s = i + 5;
+      let j = s;
+      while (j < n) {
+        const c = text[j];
+        if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
+        else break;
+      }
+      if (j > s && j < n && text[j] === '@') {
+        const end = matchEmailDomain(text, j + 1);
+        if (end !== -1) {
+          let linkEnd = end;
+          if (end < n && text[end] === '/') {
+            let p = end + 1;
+            while (p < n) {
+              const c = text[p];
+              if (isAlpha(c) || isDigit(c) || c === '.' || c === '@') p++;
+              else break;
+            }
+            let pe = p;
+            while (pe > end + 1 && text[pe - 1] === '.') pe--;
+            if (pe > end + 1) linkEnd = pe;
+          }
+          const full = text.slice(i, linkEnd);
+          return { href: full, text: full, end: linkEnd, extended: true };
+        }
+      }
+    }
+    return null;
+  }
   return null;
 }
 
@@ -1718,6 +1769,8 @@ function parseRefLabel(text, i) {
   while (j < n) {
     const c = text[j];
     if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
+      // Escapes are kept RAW in the label (for matching).
+      label += text[j];
       label += text[j + 1];
       j += 2;
     } else if (c === '[') return null;
@@ -1725,6 +1778,22 @@ function parseRefLabel(text, i) {
     else { label += c; j++; }
   }
   return null;
+}
+
+// Are the brackets in text[start..end) balanced (equal '[' and ']' counts,
+// ignoring backslash-escaped brackets)? Link/image text must be balanced.
+function bracketsBalanced(text, start, end) {
+  let depth = 0;
+  for (let k = start; k < end; k++) {
+    const c = text[k];
+    if (c === '\\' && k + 1 < end && isAsciiPunct(text[k + 1])) { k++; continue; }
+    if (c === '[') depth++;
+    else if (c === ']') {
+      depth--;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +1859,9 @@ function parseInline(text, refs, plain) {
   const delims = [];
   const brackets = [];
   const autoLinks = [];
+  // Positions of every ']' encountered (for the link-text balance check:
+  // a link/image only forms when its text has equal '[' and ']' counts).
+  const closes = [];
   let scopeCounter = 0;
   let i = 0;
   let textStart = 0;
@@ -1925,6 +1997,7 @@ function parseInline(text, refs, plain) {
       pushChunk('[', i + 1);
       brackets.push({
         chunk: brChunk, bangChunk, srcPos: i + 1, isImage: true, active: true,
+        closesAtPush: closes.length,
       });
       i += 2;
       textStart = i;
@@ -1937,6 +2010,7 @@ function parseInline(text, refs, plain) {
       pushChunk('[', i);
       brackets.push({
         chunk: brChunk, bangChunk: -1, srcPos: i, isImage: false, active: true,
+        closesAtPush: closes.length,
       });
       i++;
       textStart = i;
@@ -1948,6 +2022,14 @@ function parseInline(text, refs, plain) {
       while (bi >= 0 && !brackets[bi].active) bi--;
       if (bi >= 0) {
         const br = brackets[bi];
+        // Balance check: the text must have equal '[' and ']' counts.
+        // '[' count = brackets pushed after br; ']' count = closes
+        // recorded since br was pushed (not counting this ']').
+        // Unbalanced text means this ']' is skipped entirely: no link
+        // forms AND the bracket stays active for a later ']'.
+        const openCount = brackets.length - 1 - bi;
+        const closeCount = closes.length - br.closesAtPush;
+        if (openCount === closeCount) {
         const linkTextRaw = text.slice(br.srcPos + 1, i);
         let href = null;
         let title = null;
@@ -1955,6 +2037,12 @@ function parseInline(text, refs, plain) {
         if (i + 1 < n && text[i + 1] === '(') {
           const il = parseInlineLink(text, i + 1);
           if (il) { href = il.href; title = il.title; endPos = il.end; }
+          // A failed inline link falls back to the shortcut reference.
+          if (href === null) {
+            const label = normalizeLabel(linkTextRaw);
+            const ref = refs.get(label);
+            if (ref) { href = ref.href; title = ref.title; endPos = i + 1; }
+          }
         } else if (i + 1 < n && text[i + 1] === '[') {
           const rl = parseRefLabel(text, i + 1);
           if (rl) {
@@ -1964,6 +2052,8 @@ function parseInline(text, refs, plain) {
             const ref = refs.get(label);
             if (ref) { href = ref.href; title = ref.title; endPos = rl.end; }
           }
+          // A failed/undefined reference does NOT fall back to the
+          // shortcut: the bracket stays literal (cm-571).
         } else {
           const label = normalizeLabel(linkTextRaw);
           const ref = refs.get(label);
@@ -2021,14 +2111,37 @@ function parseInline(text, refs, plain) {
             brackets[bi].active = false;
           } else {
             // A link cannot contain a link: deactivate this bracket and
-            // every bracket before it.
-            for (let b2 = 0; b2 <= bi; b2++) brackets[b2].active = false;
+            // every LINK bracket before it. Image brackets survive, so
+            // an image can still form around a link in its alt text.
+            for (let b2 = 0; b2 <= bi; b2++) {
+              if (!brackets[b2].isImage) brackets[b2].active = false;
+            }
           }
+          closes.push(i);
           i = endPos;
           textStart = i;
           continue;
         }
+        // Failure (balanced text, no usable suffix): deactivate this
+        // bracket so a later ']' cannot reuse it.
+        brackets[bi].active = false;
+        // Nested-adjacent-']]' rule (cm-512): if the next char is ']' and
+        // the char after that starts a link suffix, and this bracket's
+        // parent is not the outermost active bracket, deactivate the
+        // parent too, so the next ']' pairs with the outermost bracket.
+        if (i + 1 < n && text[i + 1] === ']' && i + 2 < n &&
+            (text[i + 2] === '(' || text[i + 2] === '[')) {
+          let pi = bi - 1;
+          while (pi >= 0 && !brackets[pi].active) pi--;
+          if (pi >= 0) {
+            let qi = pi - 1;
+            while (qi >= 0 && !brackets[qi].active) qi--;
+            if (qi >= 0) brackets[pi].active = false;
+          }
+        }
+        } // end balance check
       }
+      closes.push(i);
       i++;
       continue;
     }
@@ -2087,9 +2200,9 @@ function parseInline(text, refs, plain) {
       i++;
       continue;
     }
-    // Extended autolinks (www. / schemes / mailto:).
+    // Extended autolinks (www. / schemes / mailto: / xmpp:).
     if (c === 'w' || c === 'h' || c === 'H' || c === 'f' || c === 'F' ||
-        c === 'm') {
+        c === 'm' || c === 'x') {
       const u = matchExtendedUrl(text, i);
       if (u) {
         flushText(i);
