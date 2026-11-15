@@ -1941,6 +1941,9 @@ function parseInline(text, refs, plain) {
   // Positions of every ']' encountered (for the link-text balance check:
   // a link/image only forms when its text has equal '[' and ']' counts).
   const closes = [];
+  // Positions of backtick runs with no matching closer (an unclosed
+  // backtick inside link text blocks the link from forming).
+  const unclosedTicks = [];
   let scopeCounter = 0;
   let i = 0;
   let textStart = 0;
@@ -2011,6 +2014,7 @@ function parseInline(text, refs, plain) {
         textStart = i;
         continue;
       }
+      unclosedTicks.push(i);
       i = j;
       continue;
     }
@@ -2107,7 +2111,14 @@ function parseInline(text, refs, plain) {
         // forms AND the bracket stays active for a later ']'.
         const openCount = brackets.length - 1 - bi;
         const closeCount = closes.length - br.closesAtPush;
-        if (openCount === closeCount) {
+        // Backtick parity: an ODD number of unclosed backtick runs in the
+        // link text blocks the link (the ']' is inside a code span); an
+        // even number does not.
+        let tickCount = 0;
+        for (const tp of unclosedTicks) {
+          if (tp > br.srcPos && tp < i) tickCount++;
+        }
+        if (openCount === closeCount && tickCount % 2 === 0) {
         const linkTextRaw = text.slice(br.srcPos + 1, i);
         let href = null;
         let title = null;
