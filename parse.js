@@ -1177,19 +1177,23 @@ function consumeQuote(lines, i, refs) {
 function collectItem(lines, j, m, refs) {
   const contentIndent = m.contentIndent;
   const itemLines = [{ t: m.content, nl: lines[j].nl }];
-  // Fence state within the item: while a fence is open, under-indented
-  // non-fence lines are fence content (they stay in the item).
+  // Fence state within the item: while a fence is open AND already has
+  // at least one content line, under-indented non-fence lines are fence
+  // content (they stay in the item). If the first line after the fence
+  // open is under-indented, the item ends and the fence is empty.
   let fenceCh = null;
   let fenceLen = 0;
+  let fenceHasContent = false;
   const fm0 = matchFence(m.content);
   if (fm0) { fenceCh = fm0.ch; fenceLen = fm0.len; }
   function trackFence(stripped) {
     if (fenceCh === null) {
       const fm = matchFence(stripped);
-      if (fm) { fenceCh = fm.ch; fenceLen = fm.len; }
+      if (fm) { fenceCh = fm.ch; fenceLen = fm.len; fenceHasContent = false; }
     } else if (isClosingFence(stripped, fenceCh, fenceLen)) {
       fenceCh = null;
       fenceLen = 0;
+      fenceHasContent = false;
     }
   }
   let k = j + 1;
@@ -1223,15 +1227,18 @@ function collectItem(lines, j, m, refs) {
     const [w] = leadingWs(t);
     if (w >= contentIndent && !isBlankStart(t)) {
       const stripped = sliceFromCol(t, contentIndent, true);
+      const fenceWasOpen = fenceCh !== null;
       itemLines.push({ t: stripped, nl: L.nl });
       trackFence(stripped);
+      if (fenceWasOpen && fenceCh !== null) fenceHasContent = true;
       k++;
       needCheck = true;
       continue;
     }
-    // While a fence is open, an under-indented line that is not itself a
-    // fence line is fence content (kept as-is). A fence line ends the item.
-    if (fenceCh !== null && matchFence(t) === null) {
+    // While a fence is open with content, an under-indented line that is
+    // not itself a fence line is fence content (kept as-is). A fence line
+    // ends the item.
+    if (fenceCh !== null && fenceHasContent && matchFence(t) === null) {
       itemLines.push({ t, nl: L.nl });
       k++;
       needCheck = true;
