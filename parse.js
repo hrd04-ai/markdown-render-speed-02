@@ -1944,6 +1944,9 @@ function parseInline(text, refs, plain) {
   // Positions of backtick runs with no matching closer (an unclosed
   // backtick inside link text blocks the link from forming).
   const unclosedTicks = [];
+  // Marked quirk: after a link whose text contains an unclosed backtick
+  // run, emphasis delimiters are suppressed until the next backtick run.
+  let suppressEmUntilTick = false;
   let scopeCounter = 0;
   let i = 0;
   let textStart = 0;
@@ -1986,6 +1989,7 @@ function parseInline(text, refs, plain) {
     }
     // Code spans.
     if (c === '`') {
+      suppressEmUntilTick = false;
       let j = i;
       while (j < n && text[j] === '`') j++;
       const runLen = j - i;
@@ -2074,7 +2078,8 @@ function parseInline(text, refs, plain) {
         pushChunk(text.slice(i, j), i);
         delims.push({
           chunk: chunkIdx, ch: c, len: runLen, canOpen, canClose,
-          scope: 0, openTags: [], closeTags: [], dead: false,
+          scope: 0, openTags: [], closeTags: [],
+          dead: suppressEmUntilTick,
         });
         i = j;
         textStart = i;
@@ -2183,6 +2188,17 @@ function parseInline(text, refs, plain) {
           if (ref) { href = ref.href; title = ref.title; endPos = i + 1; }
         }
         if (href !== null) {
+          // Unclosed backtick in link text suppresses later emphasis
+          // until the next backtick run (only when one exists later).
+          if (!br.isImage) {
+            for (const tp of unclosedTicks) {
+              if (tp > br.srcPos && tp < i &&
+                  text.indexOf('`', endPos) !== -1) {
+                suppressEmUntilTick = true;
+                break;
+              }
+            }
+          }
           flushText(i);
           const L = chunks.length;
           if (!br.isImage) {
