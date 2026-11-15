@@ -1516,6 +1516,18 @@ function matchInlineHtml(text, i) {
   return matchInlineTag(text, i);
 }
 
+// Marked quirk: an inline <a> open tag sets a document-global "in link"
+// state that suppresses extended autolinks (www/http/email) in the rest
+// of the document until a </a> close tag clears it. The state persists
+// across blocks (paragraphs, headings, lists, blockquotes). The trigger
+// is narrow: the open tag must be "<a" + a literal SPACE (tab/newline/
+// '>'/'/' after the name do not set it; bare <a> and <a/> do not set
+// it), and only the exact 4-char tag "</a>" (any case) clears it —
+// "</a >", "</a\t>" and "</a\n>" do not. Tags inside HTML blocks, code
+// spans, or link text do not affect the state (a link's text is parsed
+// in an isolated scope that restores the state when the link forms).
+let inLinkGlobal = false;
+
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
 // separated by single dots, at least two labels. Returns the end index of
 // the domain within text starting at dStart, or -1. Trailing dots are
@@ -2129,7 +2141,7 @@ function parseInline(text, refs, plain) {
       pushChunk('[', i + 1);
       brackets.push({
         chunk: brChunk, bangChunk, srcPos: i + 1, isImage: true, active: true,
-        closesAtPush: closes.length,
+        closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
       });
       i += 2;
       textStart = i;
@@ -2142,7 +2154,7 @@ function parseInline(text, refs, plain) {
       pushChunk('[', i);
       brackets.push({
         chunk: brChunk, bangChunk: -1, srcPos: i, isImage: false, active: true,
-        closesAtPush: closes.length,
+        closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
       });
       i++;
       textStart = i;
@@ -2267,6 +2279,9 @@ function parseInline(text, refs, plain) {
               if (!brackets[b2].isImage) brackets[b2].active = false;
             }
           }
+          // Link text is an isolated scope: an <a> tag inside it does
+          // not leak into the document-global in-link state.
+          inLinkGlobal = br.inLinkAtPush;
           closes.push(i);
           i = endPos;
           textStart = i;
@@ -2314,6 +2329,17 @@ function parseInline(text, refs, plain) {
         flushText(i);
         if (plain) pushChunk(escapeNoEncode(text.slice(i, he)), i);
         else pushChunk(text.slice(i, he), i);
+        // An inline <a> tag sets the document-global in-link state
+        // (suppresses extended autolinks); the exact tag "</a>" clears
+        // it. The open tag needs a literal space after the name.
+        if (he - i === 4 && text[i + 1] === '/' &&
+            (text[i + 2] === 'a' || text[i + 2] === 'A') &&
+            text[i + 3] === '>') {
+          inLinkGlobal = false;
+        } else if ((text[i + 1] === 'a' || text[i + 1] === 'A') &&
+            text[i + 2] === ' ') {
+          inLinkGlobal = true;
+        }
         i = he;
         textStart = i;
         continue;
@@ -2350,9 +2376,11 @@ function parseInline(text, refs, plain) {
       i++;
       continue;
     }
-    // Extended autolinks (www. / schemes / mailto: / xmpp:).
-    if (c === 'w' || c === 'h' || c === 'H' || c === 'f' || c === 'F' ||
-        c === 'm' || c === 'x') {
+    // Extended autolinks (www. / schemes / mailto: / xmpp:). Suppressed
+    // while the document-global in-link state is set (an unclosed
+    // inline <a> tag earlier in the document).
+    if (!inLinkGlobal && (c === 'w' || c === 'h' || c === 'H' || c === 'f' ||
+        c === 'F' || c === 'm' || c === 'x')) {
       let trimUs = false;
       for (const d of delims) {
         if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
@@ -2406,8 +2434,9 @@ function parseInline(text, refs, plain) {
       i++;
       continue;
     }
-    // Bare emails.
-    if (c === '@') {
+    // Bare emails. Suppressed while the document-global in-link state
+    // is set (an unclosed inline <a> tag earlier in the document).
+    if (c === '@' && !inLinkGlobal) {
       // If an unmatched '_' opener exists, trailing '_'s in the domain
       // are emphasis delimiters (trimmed), not domain characters.
       let trimUs = false;
@@ -2595,6 +2624,7 @@ function renderBlocks(blocks, refs, out) {
 // ---------------------------------------------------------------------------
 
 export function parse(markdown) {
+  inLinkGlobal = false;
   const lines = splitLines(markdown);
   const refs = new Map();
   const blocks = parseBlocks(lines, refs);
