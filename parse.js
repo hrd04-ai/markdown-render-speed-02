@@ -1989,11 +1989,45 @@ function parseInline(text, refs, plain) {
       let j = i;
       while (j < n && text[j] === '`') j++;
       const runLen = j - i;
-      // Find a matching run of the same length.
+      // Find a matching run of the same length. A code span may cross a
+      // ']' — but not one that closes a bracket whose text has even
+      // backtick parity (a link will form there, so the ']' belongs to
+      // the link, not the code span).
       let close = -1;
       let k = j;
+      let depth = 0;
       while (k < n) {
-        if (text[k] === '`') {
+        const ch = text[k];
+        if (ch === '\\' && k + 1 < n) {
+          // Skip escaped brackets/backslash for depth tracking, but NOT
+          // escaped backticks: code spans do not process backslash escapes.
+          const nx = text[k + 1];
+          if (nx === '[' || nx === ']' || nx === '\\') { k += 2; continue; }
+          k++;
+          continue;
+        }
+        if (ch === '[') { depth++; k++; continue; }
+        if (ch === ']' && depth === 0) {
+          let bi = brackets.length - 1;
+          while (bi >= 0 && !brackets[bi].active) bi--;
+          if (bi >= 0) {
+            // Count backtick runs in the bracket text.
+            let ticks = 0;
+            let p = brackets[bi].srcPos + 1;
+            while (p < k) {
+              if (text[p] === '\\' && p + 1 < k) { p += 2; continue; }
+              if (text[p] === '`') {
+                ticks++;
+                while (p < k && text[p] === '`') p++;
+              } else p++;
+            }
+            if (ticks % 2 === 0) break;
+          }
+          k++;
+          continue;
+        }
+        if (ch === ']') { depth--; k++; continue; }
+        if (ch === '`') {
           let e = k;
           while (e < n && text[e] === '`') e++;
           if (e - k === runLen) { close = k; break; }
