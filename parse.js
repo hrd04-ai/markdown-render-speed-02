@@ -2469,6 +2469,9 @@ function parseInline(text, refs, plain) {
   // Emphasis resolution (delimiter stack, CommonMark rules + scope isolation).
   // Matched single-delimiter (em) spans, for the cross-pair blocking rule.
   const emSpans = [];
+  // Matched strong (use-2) pairs [openerIdx, closerIdx], for the blocking
+  // rule below.
+  const strongPairs = [];
   for (let di = 0; di < delims.length; di++) {
     const closer = delims[di];
     if (closer.dead || closer.len === 0 || !closer.canClose) continue;
@@ -2497,9 +2500,25 @@ function parseInline(text, refs, plain) {
           }
           if (blocked) { oi--; continue; }
         }
+        // Marked quirk: a matched ** pair whose closer can open and
+        // whose opener cannot close blocks matches across it — unless
+        // the closer run has length >= 3 or the match uses 2 (strong).
+        // Pairs already enclosed in a matched span (dead) don't block.
+        if (closer.ch === '*' && !(closer.len >= 3 || use === 2)) {
+          let blocked = false;
+          for (const p of strongPairs) {
+            if (oi < p[0] && p[1] < di) {
+              const pop = delims[p[0]], pcl = delims[p[1]];
+              if (!pop.dead && !pcl.dead && pcl.canOpen && !pop.canClose &&
+                  pop.ch === '*') { blocked = true; break; }
+            }
+          }
+          if (blocked) { oi--; continue; }
+        }
         opener.len -= use;
         closer.len -= use;
         if (use === 1 && closer.canOpen) emSpans.push([oi, di, closer.ch]);
+        if (use === 2) strongPairs.push([oi, di]);
         if (!plain) {
           opener.openTags.unshift(use === 2 ? '<strong>' : '<em>');
           closer.closeTags.push(use === 2 ? '</strong>' : '</em>');
