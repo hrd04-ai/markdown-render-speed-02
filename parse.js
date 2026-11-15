@@ -573,13 +573,16 @@ function matchHtmlBlock(t) {
 // Strip up to n columns of leading whitespace (spaces/tabs) from a line.
 // A tab straddling the boundary becomes spaces for the part after it.
 // Stops at the first non-whitespace character (never eats content).
-function stripIndent(t, n) {
+function stripIndent(t, n, tabAsOne) {
   let col = 0;
   let i = 0;
   while (i < t.length && col < n) {
     const c = t[i];
     if (c === ' ') { col++; i++; }
     else if (c === '\t') {
+      // Fences count each tab as one column (marked quirk); elsewhere a
+      // tab expands to its full width and may leave partial spaces.
+      if (tabAsOne) { col++; i++; continue; }
       const w = tabWidth(col);
       if (col + w <= n) { col += w; i++; }
       else return ' '.repeat(col + w - n) + t.slice(i + 1);
@@ -706,8 +709,9 @@ function consumeFence(lines, i, m) {
       }
     }
     // Marked quirk: only backtick fences strip the opening indent from
-    // content lines; tilde fences keep content verbatim.
-    content.push(m.ch === '`' ? stripIndent(t, m.indent) : t);
+    // content lines; tilde fences keep content verbatim. Tabs count as
+    // one column when stripping.
+    content.push(m.ch === '`' ? stripIndent(t, m.indent, true) : t);
     j++;
   }
   // A trailing blank content line is dropped (exactly one).
