@@ -2278,7 +2278,39 @@ function parseInline(text, refs, plain) {
       for (const d of delims) {
         if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
       }
-      const u = matchExtendedUrl(text, i, trimUs);
+      let u = matchExtendedUrl(text, i, trimUs);
+      // If the URL swallowed a ']' that closes an active bracket AND a link
+      // will form from that ']', truncate the URL to before the ']'
+      // (otherwise the ']' is part of the URL and no link forms).
+      if (u && u.text.includes(']')) {
+        let bi = brackets.length - 1;
+        while (bi >= 0 && !brackets[bi].active) bi--;
+        if (bi >= 0) {
+          const closePos = i + u.text.indexOf(']');
+          const after = text[closePos + 1];
+          let linkForms = false;
+          if (after === '(') {
+            linkForms = parseInlineLink(text, closePos + 1) !== null;
+          } else if (after === '[') {
+            const rl = parseRefLabel(text, closePos + 1);
+            if (rl) linkForms = refs.has(normalizeLabel(rl.label));
+          } else {
+            const label = text.slice(brackets[bi].srcPos + 1, closePos);
+            linkForms = refs.has(normalizeLabel(label));
+          }
+          if (linkForms) {
+            const trunc = trimUrlCandidate(text.slice(i, closePos));
+            if (trunc) {
+              if (u.href !== u.text) u.href = 'http://' + trunc;
+              else u.href = trunc;
+              u.text = trunc;
+              u.end = i + trunc.length;
+            } else {
+              u = null;
+            }
+          }
+        }
+      }
       if (u) {
         flushText(i);
         if (plain) pushChunk(esc(u.text), i);
