@@ -1024,8 +1024,13 @@ function consumeParagraph(lines, i, refs, inListItem) {
     let k = j + 1;
     while (k < lines.length) {
       const L = lines[k];
-      if (isBlankLine(L)) break;
-      if (!isTableBodyRow(L.t)) break;
+      // Marked quirk: a terminated line of 0-3 spaces + a single tab is a
+      // body row (empty cells), not a blank line ending the table.
+      const tabRow = L.nl && /^ {0,3}\t$/.test(L.t);
+      if (!tabRow) {
+        if (isBlankLine(L)) break;
+        if (!isTableBodyRow(L.t)) break;
+      }
       const cells = splitTableRow(L.t);
       while (cells.length < header.length) cells.push('');
       body.push(cells.slice(0, header.length));
