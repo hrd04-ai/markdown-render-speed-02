@@ -705,7 +705,9 @@ function consumeFence(lines, i, m) {
         if (ok) { j++; break; }
       }
     }
-    content.push(stripIndent(t, m.indent));
+    // Marked quirk: only backtick fences strip the opening indent from
+    // content lines; tilde fences keep content verbatim.
+    content.push(m.ch === '`' ? stripIndent(t, m.indent) : t);
     j++;
   }
   // A trailing blank content line is dropped (exactly one).
