@@ -1903,16 +1903,17 @@ function findTildeCloser(text, from, len) {
   let depth = 0;
   let i = from;
   while (i < n) {
+    if (text[i] === '\\' && i + 1 < n) { i += 2; continue; }
     if (text[i] === '~') {
       let j = i;
       while (j < n && text[j] === '~') j++;
       if (j - i === len) {
-        const prev = i === 0 ? '' : text[i - 1];
-        const next = j >= n ? '' : text[j];
-        const canClose = prev !== '' && prev !== '~' &&
-          prev !== ' ' && prev !== '\t' && prev !== '\n';
-        const canOpen = next !== '' &&
-          next !== ' ' && next !== '\t' && next !== '\n';
+        // Strikethrough uses the same flanking rules as emphasis: a run
+        // preceded by punctuation (e.g. an escaped '~') and followed by a
+        // letter can only open, not close.
+        const { left, right } = flanking(text, i, j);
+        const canClose = right;
+        const canOpen = left;
         if (canClose) {
           if (depth === 0) return i;
           depth--;
@@ -2047,8 +2048,7 @@ function parseInline(text, refs, plain) {
       let j = i;
       while (j < n && text[j] === '~') j++;
       const runLen = j - i;
-      if ((runLen === 1 || runLen === 2) && j < n &&
-          text[j] !== ' ' && text[j] !== '\t' && text[j] !== '\n') {
+      if ((runLen === 1 || runLen === 2) && flanking(text, i, j).left) {
         const closer = findTildeCloser(text, j, runLen);
         if (closer !== -1) {
           flushText(i);
