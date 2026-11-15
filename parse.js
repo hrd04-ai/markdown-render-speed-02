@@ -318,6 +318,22 @@ function matchFence(t) {
   return { ch, len, indent: i, info };
 }
 
+// Is this line a closing fence for a fence of (ch, len)? Same char, run
+// >= len, only spaces/tabs after, 0-3 leading spaces.
+function isClosingFence(t, ch, len) {
+  let k = 0;
+  while (k < t.length && t[k] === ' ' && k < 3) k++;
+  if (k < t.length && t[k] === '\t') return false;
+  if (k >= t.length) return false;
+  let r = k;
+  while (r < t.length && t[r] === ch) r++;
+  if (r - k < len) return false;
+  for (let q = r; q < t.length; q++) {
+    if (!isSpaceOrTab(t[q])) return false;
+  }
+  return true;
+}
+
 // ATX heading. Returns {level, text} or null.
 function matchATX(t) {
   let i = 0;
@@ -1154,6 +1170,21 @@ function consumeQuote(lines, i, refs) {
 function collectItem(lines, j, m, refs) {
   const contentIndent = m.contentIndent;
   const itemLines = [{ t: m.content, nl: lines[j].nl }];
+  // Fence state within the item: while a fence is open, under-indented
+  // non-fence lines are fence content (they stay in the item).
+  let fenceCh = null;
+  let fenceLen = 0;
+  const fm0 = matchFence(m.content);
+  if (fm0) { fenceCh = fm0.ch; fenceLen = fm0.len; }
+  function trackFence(stripped) {
+    if (fenceCh === null) {
+      const fm = matchFence(stripped);
+      if (fm) { fenceCh = fm.ch; fenceLen = fm.len; }
+    } else if (isClosingFence(stripped, fenceCh, fenceLen)) {
+      fenceCh = null;
+      fenceLen = 0;
+    }
+  }
   let k = j + 1;
   let needCheck = false;
   let paraOpen = false;
@@ -1161,6 +1192,9 @@ function collectItem(lines, j, m, refs) {
     const L = lines[k];
     const t = L.t;
     if (isBlankLine(L)) {
+      // A blank line uses the normal logic even inside a fence: the item
+      // ends here unless the next non-blank line is indented to the
+      // content indent (a blank line breaks fence-content capture).
       // An item with no content yet ends at a blank line (it stays empty).
       let hasContent = false;
       for (const il of itemLines) {
@@ -1181,7 +1215,17 @@ function collectItem(lines, j, m, refs) {
     }
     const [w] = leadingWs(t);
     if (w >= contentIndent && !isBlankStart(t)) {
-      itemLines.push({ t: sliceFromCol(t, contentIndent, true), nl: L.nl });
+      const stripped = sliceFromCol(t, contentIndent, true);
+      itemLines.push({ t: stripped, nl: L.nl });
+      trackFence(stripped);
+      k++;
+      needCheck = true;
+      continue;
+    }
+    // While a fence is open, an under-indented line that is not itself a
+    // fence line is fence content (kept as-is). A fence line ends the item.
+    if (fenceCh !== null && matchFence(t) === null) {
+      itemLines.push({ t, nl: L.nl });
       k++;
       needCheck = true;
       continue;
@@ -1457,8 +1501,11 @@ function matchInlineHtml(text, i) {
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
 // separated by single dots, at least two labels. Returns the end index of
 // the domain within text starting at dStart, or -1. Trailing dots are
-// trimmed; a domain ending in '_' or '-' rejects the whole match.
-function matchEmailDomain(text, dStart) {
+// trimmed; a domain ending in '-' rejects the whole match. A domain ending
+// in '_' also rejects, UNLESS trimTrailingUnderscore is set (an unmatched
+// '_' opener exists earlier, so the trailing '_'s are emphasis delimiters,
+// not part of the domain) — then they are trimmed instead.
+function matchEmailDomain(text, dStart, trimTrailingUnderscore) {
   const n = text.length;
   let j = dStart;
   while (j < n) {
@@ -1467,7 +1514,15 @@ function matchEmailDomain(text, dStart) {
     else break;
   }
   let end = j;
-  while (end > dStart && text[end - 1] === '.') end--;
+  for (;;) {
+    while (end > dStart && text[end - 1] === '.') end--;
+    if (trimTrailingUnderscore) {
+      let trimmed = false;
+      while (end > dStart && text[end - 1] === '_') { end--; trimmed = true; }
+      if (trimmed) continue;
+    }
+    break;
+  }
   if (end === dStart) return -1;
   const last = text[end - 1];
   if (last === '_' || last === '-') return -1;
@@ -1481,16 +1536,19 @@ function matchEmailDomain(text, dStart) {
 }
 
 // Match a bare email with '@' at atPos. Returns {start, end} or null.
-function matchEmail(text, atPos) {
+function matchEmail(text, atPos, minStart, trimTrailingUnderscore) {
+  // The local part must not scan before minStart (the current text run
+  // start): a '_' emphasis delimiter before it is not part of the email.
   let s = atPos - 1;
-  while (s >= 0) {
+  const lo = minStart === undefined ? 0 : minStart;
+  while (s >= lo) {
     const c = text[s];
     if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') s--;
     else break;
   }
   const start = s + 1;
   if (start === atPos) return null;
-  const end = matchEmailDomain(text, atPos + 1);
+  const end = matchEmailDomain(text, atPos + 1, trimTrailingUnderscore);
   if (end === -1) return null;
   return { start, end };
 }
@@ -1597,7 +1655,7 @@ const WWW_PRECEDING_OK = new Set([' ', '\t', '\n', '(', '*', '_', '~']);
 // Match an extended autolink starting at text[i]. Returns
 // {href, text, end, extended} or null. Handles www., http(s)://, ftp://,
 // mailto:, and bare emails (via '@').
-function matchExtendedUrl(text, i) {
+function matchExtendedUrl(text, i, trimTrailingUnderscore) {
   const n = text.length;
   // www. (lowercase only, restricted preceding char, host starts alnum/-).
   if (text.startsWith('www.', i)) {
@@ -1628,7 +1686,7 @@ function matchExtendedUrl(text, i) {
   // mailto: (lowercase only, preceding char must not be a word char).
   if (text.startsWith('mailto:', i)) {
     const prev = i === 0 ? '' : text[i - 1];
-    if (i === 0 || !isWordChar(prev)) {
+    if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
       // The email must start right after 'mailto:'.
       let s = i + 7;
       let j = s;
@@ -1638,7 +1696,7 @@ function matchExtendedUrl(text, i) {
         else break;
       }
       if (j > s && j < n && text[j] === '@') {
-        const end = matchEmailDomain(text, j + 1);
+        const end = matchEmailDomain(text, j + 1, trimTrailingUnderscore);
         if (end !== -1) {
           const email = text.slice(s, end);
           const full = 'mailto:' + email;
@@ -1653,7 +1711,7 @@ function matchExtendedUrl(text, i) {
   // with trailing '.'s trimmed. (The only other scheme+email autolink.)
   if (text.startsWith('xmpp:', i)) {
     const prev = i === 0 ? '' : text[i - 1];
-    if (i === 0 || !isWordChar(prev)) {
+    if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
       let s = i + 5;
       let j = s;
       while (j < n) {
@@ -1662,7 +1720,7 @@ function matchExtendedUrl(text, i) {
         else break;
       }
       if (j > s && j < n && text[j] === '@') {
-        const end = matchEmailDomain(text, j + 1);
+        const end = matchEmailDomain(text, j + 1, trimTrailingUnderscore);
         if (end !== -1) {
           let linkEnd = end;
           if (end < n && text[end] === '/') {
@@ -1830,9 +1888,14 @@ function underscoreInEmail(text, start) {
 }
 
 // Find the closing '~' run for an opener of length len, searching from `from`.
+// Stack discipline via depth counting (same-length runs only): a run that
+// can close matches the nearest unmatched opener (depth 0 = our opener);
+// a run that can only open increases the depth. This gives proper nesting
+// (~~a ~~b~~ c~~ nests) instead of first-closer matching.
 // Returns the closer's run start, or -1.
 function findTildeCloser(text, from, len) {
   const n = text.length;
+  let depth = 0;
   let i = from;
   while (i < n) {
     if (text[i] === '~') {
@@ -1840,8 +1903,16 @@ function findTildeCloser(text, from, len) {
       while (j < n && text[j] === '~') j++;
       if (j - i === len) {
         const prev = i === 0 ? '' : text[i - 1];
-        if (prev !== '' && prev !== '~' && prev !== ' ' && prev !== '\t' && prev !== '\n') {
-          return i;
+        const next = j >= n ? '' : text[j];
+        const canClose = prev !== '' && prev !== '~' &&
+          prev !== ' ' && prev !== '\t' && prev !== '\n';
+        const canOpen = next !== '' &&
+          next !== ' ' && next !== '\t' && next !== '\n';
+        if (canClose) {
+          if (depth === 0) return i;
+          depth--;
+        } else if (canOpen) {
+          depth++;
         }
       }
       i = j;
@@ -2203,7 +2274,11 @@ function parseInline(text, refs, plain) {
     // Extended autolinks (www. / schemes / mailto: / xmpp:).
     if (c === 'w' || c === 'h' || c === 'H' || c === 'f' || c === 'F' ||
         c === 'm' || c === 'x') {
-      const u = matchExtendedUrl(text, i);
+      let trimUs = false;
+      for (const d of delims) {
+        if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
+      }
+      const u = matchExtendedUrl(text, i, trimUs);
       if (u) {
         flushText(i);
         if (plain) pushChunk(esc(u.text), i);
@@ -2222,8 +2297,14 @@ function parseInline(text, refs, plain) {
     }
     // Bare emails.
     if (c === '@') {
-      const em = matchEmail(text, i);
-      if (em && em.start >= textStart) {
+      // If an unmatched '_' opener exists, trailing '_'s in the domain
+      // are emphasis delimiters (trimmed), not domain characters.
+      let trimUs = false;
+      for (const d of delims) {
+        if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
+      }
+      const em = matchEmail(text, i, textStart, trimUs);
+      if (em) {
         flushText(em.start);
         if (plain) pushChunk(esc(text.slice(em.start, em.end)), em.start);
         else {
