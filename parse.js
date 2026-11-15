@@ -2427,6 +2427,8 @@ function parseInline(text, refs, plain) {
   flushText(n);
 
   // Emphasis resolution (delimiter stack, CommonMark rules + scope isolation).
+  // Matched single-delimiter (em) spans, for the cross-pair blocking rule.
+  const emSpans = [];
   for (let di = 0; di < delims.length; di++) {
     const closer = delims[di];
     if (closer.dead || closer.len === 0 || !closer.canClose) continue;
@@ -2446,8 +2448,18 @@ function parseInline(text, refs, plain) {
           continue;
         }
         const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
+        // Marked quirk: a single-* closer cannot match a ** opener
+        // across a matched em pair whose closer can also open.
+        if (use === 1 && opener.len >= 2 && closer.ch === '*') {
+          let blocked = false;
+          for (const s of emSpans) {
+            if (s[2] === '*' && oi < s[0] && s[1] < di) { blocked = true; break; }
+          }
+          if (blocked) { oi--; continue; }
+        }
         opener.len -= use;
         closer.len -= use;
+        if (use === 1 && closer.canOpen) emSpans.push([oi, di, closer.ch]);
         if (!plain) {
           opener.openTags.unshift(use === 2 ? '<strong>' : '<em>');
           closer.closeTags.push(use === 2 ? '</strong>' : '</em>');
