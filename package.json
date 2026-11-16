@@ -1,1 +1,1 @@
-{"type":"module"}
+{"description":"Dependency-free CommonMark 0.31.2 + GFM parser, byte-identical to marked 18.1.3 and faster — make.fun markdown-render-speed-02 entry.","name":"markdown-render-speed-02","scripts":{"start":"node main.ts"},"type":"module","version":"1.0.0"}
