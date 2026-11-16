@@ -534,34 +534,33 @@ function matchSetext(t) {
   return ch === '=' ? 1 : 2;
 }
 
-// Scan up to 3 columns of leading spaces. Returns [col, i] (the column
-// reached and the index after the spaces), or null when a tab appears
-// first: a tab reaches column 4, so the line cannot open a block that
-// allows at most 3 leading spaces. Shared by the blockquote and list
-// matchers, which scan their indent the same way.
+// Scan up to 3 columns of leading spaces. Returns the index after the
+// spaces — which also equals the column reached, since only spaces are
+// scanned — or -1 when a tab appears first: a tab reaches column 4, so
+// the line cannot open a block that allows at most 3 leading spaces.
+// Shared by the blockquote and list matchers, which scan their indent
+// the same way.
 function scanIndent3(t) {
-  let col = 0;
   let i = 0;
-  while (i < t.length && col < 3) {
+  while (i < t.length && i < 3) {
     const c = t[i];
     if (c === ' ') {
-      col++;
       i++;
     } else if (c === '\t') {
-      return null;
+      return -1;
     } else {
       break;
     }
   }
-  return [col, i];
+  return i;
 }
 
 // Blockquote prefix. Returns the rest of the line (leading tabs expanded
 // using the original columns), or null when the line has no quote marker.
 function matchBlockquote(t) {
-  const scanned = scanIndent3(t);
-  if (scanned === null) return null;
-  let [col, i] = scanned;
+  let i = scanIndent3(t);
+  if (i === -1) return null;
+  let col = i;
   if (i >= t.length || t[i] !== '>') return null;
   i++;
   col++;
@@ -589,9 +588,9 @@ function matchBlockquote(t) {
 //  content (string after marker + whitespace, tabs expanded),
 //  empty (no content on this line)}
 function matchListMarker(t) {
-  const scanned = scanIndent3(t);
-  if (scanned === null) return null;
-  const [indent, i] = scanned;
+  const i = scanIndent3(t);
+  if (i === -1) return null;
+  const indent = i;
   if (i >= t.length) return null;
   let ordered = false;
   let delim = '';
@@ -1309,21 +1308,6 @@ function collectTableBody(lines, k, header) {
   return { body, next: k };
 }
 
-// Handle one paragraph continuation line inside a list item. Marked
-// quirk: a continuation line with 4+ columns of leading whitespace loses
-// 4 columns (top-level paragraphs keep their leading whitespace as-is),
-// and a non-stripped continuation line following a stripped one is
-// preceded by a blank line inside the paragraph. Returns
-// {line, stripped, blankBefore}.
-function paraContinuationLine(t, inListItem, prevStripped) {
-  if (!inListItem) return { line: t, stripped: false, blankBefore: false };
-  const [w] = leadingWs(t);
-  if (w >= 4) {
-    return { line: stripIndent(t, 4), stripped: true, blankBefore: false };
-  }
-  return { line: t, stripped: false, blankBefore: prevStripped };
-}
-
 // Build the blocks for a finished paragraph. text is the paragraph text
 // after link definitions were extracted; how says how the paragraph
 // ended ('blank', 'interrupt', 'setext', 'table').
@@ -1399,10 +1383,20 @@ function consumeParagraph(lines, i, refs, inListItem) {
       how = 'interrupt';
       break;
     }
-    const cont = paraContinuationLine(t, inListItem, strippedPrev);
-    if (cont.blankBefore) collected.push('');
-    collected.push(cont.line);
-    strippedPrev = cont.stripped;
+    // Marked quirk: inside a list item, a paragraph continuation line
+    // with 4+ columns of leading whitespace loses 4 columns (top-level
+    // paragraphs keep their leading whitespace as-is). A non-stripped
+    // continuation line following a stripped one is preceded by a blank
+    // line inside the paragraph.
+    if (inListItem && leadingWs(t)[0] >= 4) {
+      collected.push(stripIndent(t, 4));
+      strippedPrev = true;
+      j++;
+      continue;
+    }
+    if (inListItem && strippedPrev) collected.push('');
+    strippedPrev = false;
+    collected.push(t);
     j++;
   }
   const text = extractLinkDefs(collected.join('\n'), refs);
@@ -2237,9 +2231,9 @@ function matchWwwAutolink(text, i) {
 }
 
 // Schemes http/https/ftp (case-insensitive), no preceding restriction.
-function matchHttpAutolink(text, i) {
+// low is the lowercased text starting at i (computed once by the caller).
+function matchHttpAutolink(text, i, low) {
   const n = text.length;
-  const low = text.slice(i, i + 8).toLowerCase();
   let schemeLen = 0;
   if (low.startsWith('https://')) schemeLen = 8;
   else if (low.startsWith('http://')) schemeLen = 7;
@@ -2292,19 +2286,21 @@ function matchXmppAutolink(text, i, trimTrailingUnderscore) {
 
 // Match an extended autolink starting at text[i]. Returns
 // {href, text, end, extended} or null. Handles www., http(s)://, ftp://,
-// mailto:, and bare emails (via '@').
+// mailto:, and bare emails (via '@'). The prefixes are disjoint, so the
+// check order is free: the case-insensitive http check (which allocates
+// a lowercased slice) runs last.
 function matchExtendedUrl(text, i, trimTrailingUnderscore) {
   if (text.startsWith('www.', i)) return matchWwwAutolink(text, i);
-  const low = text.slice(i, i + 8).toLowerCase();
-  if (low.startsWith('https://') || low.startsWith('http://') ||
-      low.startsWith('ftp://')) {
-    return matchHttpAutolink(text, i);
-  }
   if (text.startsWith('mailto:', i)) {
     return matchMailtoAutolink(text, i, trimTrailingUnderscore);
   }
   if (text.startsWith('xmpp:', i)) {
     return matchXmppAutolink(text, i, trimTrailingUnderscore);
+  }
+  const low = text.slice(i, i + 8).toLowerCase();
+  if (low.startsWith('https://') || low.startsWith('http://') ||
+      low.startsWith('ftp://')) {
+    return matchHttpAutolink(text, i, low);
   }
   return null;
 }
