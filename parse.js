@@ -1252,12 +1252,31 @@ function collectItem(lines, j, m, refs) {
     }
     // While a fence is open with content, an under-indented line that is
     // not itself a fence line is fence content (kept as-is). A fence line
-    // ends the item.
+    // ends the item. Exception (marked quirk): when the previous item
+    // line could start a leaf block — 4+ columns of leading whitespace
+    // (indented code), an ATX heading, an HR, or an HTML block — the
+    // under-indented line is NOT captured; the item (and the fence)
+    // ends there instead. List/blockquote markers do not break it.
     if (fenceCh !== null && fenceHasContent && matchFence(t) === null) {
-      itemLines.push({ t, nl: L.nl });
-      k++;
-      needCheck = true;
-      continue;
+      const prev = itemLines[itemLines.length - 1];
+      let blocksCapture = false;
+      if (prev) {
+        const pt = prev.t;
+        const [pw] = leadingWs(pt);
+        if (pw >= 4) blocksCapture = true;
+        else {
+          const ps = pt.slice(pw);
+          if (/^#{1,6}(?:[ \t]|$)/.test(ps)) blocksCapture = true;
+          else if (/^(-{3,}|_{3,}|\*{3,})[ \t]*$/.test(ps)) blocksCapture = true;
+          else if (matchHtmlBlock(pt) !== null) blocksCapture = true;
+        }
+      }
+      if (!blocksCapture) {
+        itemLines.push({ t, nl: L.nl });
+        k++;
+        needCheck = true;
+        continue;
+      }
     }
     if (matchListMarker(t)) break;
     if (!isLazyAble(t)) break;
