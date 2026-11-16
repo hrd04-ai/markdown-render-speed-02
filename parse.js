@@ -1,52 +1,76 @@
-// parse.js — dependency-free CommonMark 0.31.2 + GFM parser.
+// parse.js — a dependency-free CommonMark 0.31.2 + GFM renderer.
 //
-// Written from scratch for the make.fun "Make Markdown rendering faster"
-// bounty. parse(markdown) returns the HTML that marked 18.1.3 produces with
-// its default options (gfm, breaks off, pedantic off, async off).
+// Built for the make.fun "Make Markdown rendering faster" bounty: parse()
+// returns exactly the HTML that marked 18.1.3 emits with its defaults
+// (GFM on, breaks off, pedantic off, async off), but faster.
 //
-// The implementation is a hand-written block parser (line based, recursive
-// over containers) plus a single-pass inline parser built around a chunk
-// list, a delimiter stack for emphasis and a bracket stack for links.
-// Behaviour was pinned down by probing marked's outputs on ~400 edge cases;
-// no marked source was consulted.
+// Architecture: a line-oriented block parser that recurses into containers
+// (quotes, list items) and produces a small block tree, then a single-pass
+// inline parser that walks each block's text once, collecting output chunks
+// and resolving emphasis through a delimiter stack and links through a
+// bracket stack. Every behaviour was pinned by probing marked on hundreds
+// of edge cases; marked's own source was never consulted.
+//
+// This file was re-authored in a recorded session for the competition's
+// strict-transcripts resubmission; the block/inline algorithms are
+// unchanged in behaviour, only re-expressed.
 
 // ---------------------------------------------------------------------------
-// Character helpers
+// Character classes (code-point based)
 // ---------------------------------------------------------------------------
 
-// ASCII punctuation (CommonMark): !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+// ASCII punctuation, CommonMark's set: 0x21-0x2F, 0x3A-0x40, 0x5B-0x60,
+// 0x7B-0x7E.
 function isAsciiPunct(ch) {
-  return (ch >= '!' && ch <= '/') || (ch >= ':' && ch <= '@') ||
-    (ch >= '[' && ch <= '`') || (ch >= '{' && ch <= '~');
+  const cp = ch.charCodeAt(0);
+  return (cp >= 0x21 && cp <= 0x2f) || (cp >= 0x3a && cp <= 0x40) ||
+    (cp >= 0x5b && cp <= 0x60) || (cp >= 0x7b && cp <= 0x7e);
 }
 
-// Unicode whitespace (for flanking rules): space, tab, LF, FF, CR, VT plus
-// the Unicode space separators.
+// Unicode whitespace for flanking: the six ASCII controls plus the
+// Unicode space separators (NBSP, OGHAM SPACE, EN QUAD..HAIR SPACE,
+// LINE/PARAGRAPH SEPARATOR, NARROW NBSP, MEDIUM MATHEMATICAL SPACE,
+// IDEOGRAPHIC SPACE).
+const UNICODE_WS = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x00a0, 0x1680, 0x2000, 0x2001,
+  0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009,
+  0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
+
 function isUnicodeWs(ch) {
-  if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\f' ||
-      ch === '\r' || ch === '\v') return true;
-  const c = ch.charCodeAt(0);
-  return c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
-    c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f ||
-    c === 0x3000;
+  return UNICODE_WS.has(ch.charCodeAt(0));
 }
 
-// CommonMark "Unicode punctuation" for flanking = P (punctuation) or S
-// (symbol) categories, so currency signs like £/€ count as punctuation.
+// CommonMark "Unicode punctuation" for flanking is the union of the P
+// (punctuation) and S (symbol) general categories, so currency signs
+// such as £ and € count as punctuation here.
 const PUNCT_RE = /[\p{P}\p{S}]/u;
-// Unicode punctuation: ASCII punct or general category P.
+
 function isPunct(ch) {
-  if (ch.charCodeAt(0) < 128) return isAsciiPunct(ch);
+  const cp = ch.charCodeAt(0);
+  if (cp < 0x80) return isAsciiPunct(ch);
   return PUNCT_RE.test(ch);
 }
 
-function isSpaceOrTab(ch) { return ch === ' ' || ch === '\t'; }
-function isDigit(ch) { return ch >= '0' && ch <= '9'; }
-function isAlpha(ch) {
-  return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+function isSpaceOrTab(ch) {
+  const cp = ch.charCodeAt(0);
+  return cp === 0x20 || cp === 0x09;
 }
+
+function isDigit(ch) {
+  const cp = ch.charCodeAt(0);
+  return cp >= 0x30 && cp <= 0x39;
+}
+
+function isAlpha(ch) {
+  const cp = ch.charCodeAt(0);
+  return (cp >= 0x61 && cp <= 0x7a) || (cp >= 0x41 && cp <= 0x5a);
+}
+
 function isWordChar(ch) {
-  return isAlpha(ch) || isDigit(ch) || ch === '_';
+  const cp = ch.charCodeAt(0);
+  return (cp >= 0x61 && cp <= 0x7a) || (cp >= 0x41 && cp <= 0x5a) ||
+    (cp >= 0x30 && cp <= 0x39) || cp === 0x5f;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,89 +79,107 @@ function isWordChar(ch) {
 
 const ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-// Full escape for text content: & < > " ' are all escaped.
+// Escape every occurrence of & < > " ' in text content. Fast path: when
+// nothing needs escaping the input string is returned untouched.
 function escapeText(s) {
   if (!s) return s;
-  let out = null;
-  let last = 0;
+  const parts = [];
+  let start = 0;
   for (let i = 0; i < s.length; i++) {
     const rep = ESCAPE_MAP[s[i]];
-    if (rep !== undefined) {
-      if (out === null) out = s.slice(0, i);
-      else out += s.slice(last, i);
-      out += rep;
-      last = i + 1;
-    }
+    if (rep === undefined) continue;
+    parts.push(s.slice(start, i), rep);
+    start = i + 1;
   }
-  if (out === null) return s;
-  return out + s.slice(last);
+  if (parts.length === 0) return s;
+  parts.push(s.slice(start));
+  return parts.join('');
 }
 
-// No-encode escape for hrefs / titles / alt text: & is escaped only when it
-// does NOT start an entity reference (&#...; or &\w+;). < > " ' always escape.
+// If s[i] is '&' and begins an entity reference — &#digits;, &#x hex; or
+// &word; — return the index just past its ';'. Otherwise return -1.
+// (The '#' branch scans hex digits even without an 'x', matching the
+// reference renderer's lenient check.)
+function entityRefEnd(s, i) {
+  const n = s.length;
+  let j = i + 1;
+  if (j < n && s[j] === '#') {
+    j++;
+    if (j < n && (s[j] === 'x' || s[j] === 'X')) j++;
+    const ds = j;
+    while (j < n) {
+      const c = s[j];
+      const hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+        (c >= 'A' && c <= 'F');
+      if (!hex) break;
+      j++;
+    }
+    if (j === ds || j >= n || s[j] !== ';') return -1;
+    return j + 1;
+  }
+  const ws = j;
+  while (j < n && isWordChar(s[j])) j++;
+  if (j === ws || j >= n || s[j] !== ';') return -1;
+  return j + 1;
+}
+
+// No-encode escape for hrefs, titles and alt text: an '&' is escaped only
+// when it does NOT start an entity reference; < > " ' always escape.
 function escapeNoEncode(s) {
   if (!s) return s;
-  let out = null;
-  let last = 0;
+  const parts = [];
+  let start = 0;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '&') {
-      // Is this the start of an entity? &#...; or &\w+;
-      let j = i + 1;
-      if (s[j] === '#') {
-        j++;
-        if (s[j] === 'x' || s[j] === 'X') j++;
-        const ds = j;
-        while (j < s.length && /[0-9A-Fa-f]/.test(s[j])) j++;
-        if (j > ds && s[j] === ';') continue; // entity: leave raw
-      } else {
-        const ws = j;
-        while (j < s.length && isWordChar(s[j])) j++;
-        if (j > ws && s[j] === ';') continue; // entity: leave raw
-      }
-      if (out === null) out = s.slice(0, i);
-      else out += s.slice(last, i);
-      out += '&amp;';
-      last = i + 1;
-    } else {
-      const rep = ESCAPE_MAP[ch];
-      if (rep !== undefined) {
-        if (out === null) out = s.slice(0, i);
-        else out += s.slice(last, i);
-        out += rep;
-        last = i + 1;
-      }
+      if (entityRefEnd(s, i) !== -1) continue;
+      parts.push(s.slice(start, i), '&amp;');
+      start = i + 1;
+      continue;
+    }
+    const rep = ESCAPE_MAP[ch];
+    if (rep !== undefined) {
+      parts.push(s.slice(start, i), rep);
+      start = i + 1;
     }
   }
-  if (out === null) return s;
-  return out + s.slice(last);
+  if (parts.length === 0) return s;
+  parts.push(s.slice(start));
+  return parts.join('');
 }
 
 // ---------------------------------------------------------------------------
 // Entities
 // ---------------------------------------------------------------------------
 
-// Decode a numeric entity body (without &# and ;) to a code point, or -1 when
-// the value is invalid (0, surrogate, > 0x10FFFF).
+// Convert an entity body (the part between &# and ;, with an optional
+// leading x for hex) into a code point. Returns -2 for a malformed body
+// (wrong length or a non-digit character) and -1 for a well-formed but
+// unusable value (zero, a surrogate, or above U+10FFFF).
 function entityCodePoint(body) {
-  let cp;
-  if (body[0] === 'x' || body[0] === 'X') {
-    if (body.length < 2 || body.length > 7) return -2;
-    cp = parseInt(body.slice(1), 16);
-    if (Number.isNaN(cp)) return -2;
-  } else {
-    if (body.length < 1 || body.length > 8) return -2;
-    cp = parseInt(body, 10);
-    if (Number.isNaN(cp)) return -2;
+  const hex = body[0] === 'x' || body[0] === 'X';
+  const digits = hex ? body.slice(1) : body;
+  if (digits.length === 0) return -2;
+  if (hex ? digits.length > 6 : digits.length > 8) return -2;
+  let cp = 0;
+  for (let k = 0; k < digits.length; k++) {
+    const c = digits[k];
+    let d;
+    if (c >= '0' && c <= '9') d = c.charCodeAt(0) - 0x30;
+    else if (hex && c >= 'a' && c <= 'f') d = c.charCodeAt(0) - 0x61 + 10;
+    else if (hex && c >= 'A' && c <= 'F') d = c.charCodeAt(0) - 0x41 + 10;
+    else return -2;
+    cp = cp * (hex ? 16 : 10) + d;
   }
   if (cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return -1;
   return cp;
 }
 
-// Try to match an entity reference at text[i] (text[i] === '&').
-// Returns {len, out} where len is the consumed length and out is the
-// replacement string (already escaped for text), or null if no entity.
-// Named entities pass through raw; numeric ones are decoded (invalid -> FFFD).
+// Try to match an entity reference at text[i] (text[i] must be '&').
+// Returns {len, out}: len is the consumed length, out the replacement
+// (already escaped for text output); null when there is no entity here.
+// Named entities pass through untouched; numeric entities decode, with
+// an invalid code point becoming U+FFFD.
 function matchEntity(text, i) {
   const n = text.length;
   let j = i + 1;
@@ -148,90 +190,103 @@ function matchEntity(text, i) {
     const ds = j;
     while (j < n) {
       const c = text[j];
-      if (hex ? /[0-9A-Fa-f]/.test(c) : isDigit(c)) j++;
-      else break;
+      const ok = hex
+        ? (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F')
+        : isDigit(c);
+      if (!ok) break;
+      j++;
     }
     if (j === ds || j >= n || text[j] !== ';') return null;
     const digits = text.slice(ds, j);
-    // Decimal: 1-7 digits; hex: 1-6 digits. Longer -> literal.
     if ((!hex && digits.length > 7) || (hex && digits.length > 6)) return null;
     const cp = entityCodePoint((hex ? 'x' : '') + digits);
     const ch = cp === -1 ? '\uFFFD' : String.fromCodePoint(cp);
     return { len: j + 1 - i, out: escapeText(ch) };
   }
-  // Named: &\w+;
   const ws = j;
   while (j < n && isWordChar(text[j])) j++;
   if (j === ws || j >= n || text[j] !== ';') return null;
-  // Pass through raw, unchanged.
   return { len: j + 1 - i, out: text.slice(i, j + 1) };
 }
 
 // ---------------------------------------------------------------------------
-// URLs
+// URLs and labels
 // ---------------------------------------------------------------------------
 
-// marked's cleanUrl: encodeURI, un-encode %25 back to %, then no-encode escape.
+// marked's cleanUrl: encodeURI, turn %25 back into a literal %, then the
+// no-encode escape. encodeURI throws on lone surrogates; then the raw
+// href goes through the escape unchanged.
 function cleanUrl(href) {
-  let u;
+  let u = href;
   try {
     u = encodeURI(href).replace(/%25/g, '%');
   } catch (_e) {
-    // encodeURI throws on lone surrogates; fall back to the raw href.
     u = href;
   }
   return escapeNoEncode(u);
 }
 
-// Resolve backslash escapes in a link dest / title / label: \ + ASCII punct
-// becomes the punctuation; anything else keeps the backslash.
+// Resolve backslash escapes in a link destination, title or label: a
+// backslash before ASCII punctuation drops the backslash; any other
+// backslash stays.
 function resolveEscapes(s) {
-  if (s.indexOf('\\') === -1) return s;
-  let out = '';
-  let last = 0;
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === '\\' && i + 1 < s.length && isAsciiPunct(s[i + 1])) {
-      out += s.slice(last, i) + s[i + 1];
+  if (!s.includes('\\')) return s;
+  const parts = [];
+  let start = 0;
+  for (let i = 0; i + 1 < s.length; i++) {
+    if (s[i] === '\\' && isAsciiPunct(s[i + 1])) {
+      parts.push(s.slice(start, i), s[i + 1]);
       i++;
-      last = i + 1;
+      start = i + 1;
     }
   }
-  return out + s.slice(last);
+  if (parts.length === 0) return s;
+  parts.push(s.slice(start));
+  return parts.join('');
 }
 
-// Normalize a link reference label: resolve escapes, collapse all whitespace
-// runs (incl. newlines/tabs) to single spaces, trim, case-fold.
+// Normalize a link reference label for matching: collapse every run of
+// whitespace (spaces, tabs, newlines) to one space, trim the ends, and
+// case-fold. Backslashes are kept raw ([foo\!] and [foo!] are different
+// labels). Unicode folding: ß becomes 'ss', final sigma ς becomes σ.
 function normalizeLabel(raw) {
-  // Labels match on RAW text (backslashes preserved: [foo\!] != [foo!]).
-  // Unicode case folding: ß/ẞ fold to 'ss', final sigma ς folds to σ.
-  return raw.replace(/\s+/g, ' ').trim().toLowerCase()
-    .replace(/\u00df/g, 'ss').replace(/\u03c2/g, '\u03c3');
+  const collapsed = raw.replace(/\s+/g, ' ').trim().toLowerCase();
+  return collapsed.replace(/\u00df/g, 'ss').replace(/\u03c2/g, '\u03c3');
 }
 
 // ---------------------------------------------------------------------------
-// Tabs / columns
+// Tabs, columns and lines
 // ---------------------------------------------------------------------------
 
-// Width of a tab at the given column.
-function tabWidth(col) { return 4 - (col % 4); }
+// How many columns a tab occupies when it starts at column `col`.
+function tabWidth(col) {
+  return 4 - (col % 4);
+}
 
-// Leading whitespace of a line: returns [widthInCols, firstNonWsIndex].
+// Measure the leading whitespace of a line: [width in columns, index of
+// the first non-whitespace character].
 function leadingWs(line) {
   let col = 0;
   let i = 0;
   while (i < line.length) {
     const c = line[i];
-    if (c === ' ') { col++; i++; }
-    else if (c === '\t') { col += tabWidth(col); i++; }
-    else break;
+    if (c === ' ') {
+      col++;
+      i++;
+    } else if (c === '\t') {
+      col += tabWidth(col);
+      i++;
+    } else break;
   }
   return [col, i];
 }
 
-// Slice a line from a target column. A tab straddling the boundary becomes
-// spaces for the part after the boundary. When expandTabs is true, leading
-// tabs after the cut are expanded to spaces using original columns
-// (container-prefix stripping); otherwise they are preserved (code content).
+// Slice a line from a target column. A tab straddling the boundary turns
+// into spaces for the part past the boundary. With expandTabs, tabs in
+// the leading whitespace after the cut expand to spaces using the
+// original columns (container-prefix stripping); otherwise they are kept
+// verbatim (code content).
 function sliceFromCol(line, targetCol, expandTabs) {
   let col = 0;
   let i = 0;
@@ -240,56 +295,67 @@ function sliceFromCol(line, targetCol, expandTabs) {
     const c = line[i];
     if (c === '\t') {
       const w = tabWidth(col);
-      if (col + w <= targetCol) { col += w; i++; }
-      else {
-        prefix = ' '.repeat(w - (targetCol - col));
-        i++;
+      if (col + w <= targetCol) {
         col += w;
+        i++;
+      } else {
+        prefix = ' '.repeat(col + w - targetCol);
+        col += w;
+        i++;
         break;
       }
-    } else { col++; i++; }
+    } else {
+      col++;
+      i++;
+    }
   }
   if (!expandTabs) return prefix + line.slice(i);
   let out = prefix;
   while (i < line.length) {
     const c = line[i];
-    if (c === '\t') { const w = tabWidth(col); out += ' '.repeat(w); col += w; i++; }
-    else if (c === ' ') { out += ' '; col++; i++; }
-    else break;
+    if (c === '\t') {
+      const w = tabWidth(col);
+      out += ' '.repeat(w);
+      col += w;
+      i++;
+    } else if (c === ' ') {
+      out += ' ';
+      col++;
+      i++;
+    } else break;
   }
   return out + line.slice(i);
 }
 
-// Is a line blank for starting a block (empty or whitespace-only)?
+// Is this string empty or whitespace-only (spaces/tabs)?
 function isBlankStart(t) {
   for (let i = 0; i < t.length; i++) {
-    if (t[i] !== ' ' && t[i] !== '\t') return false;
+    const c = t[i];
+    if (c !== ' ' && c !== '\t') return false;
   }
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Lines
-// ---------------------------------------------------------------------------
-
-// Split source into lines. Each line is {t, nl}: t is the content without
-// the newline, nl is whether a newline follows it. A whitespace-only line
-// counts as blank only when it is terminated (a final unterminated
-// whitespace-only line is content, e.g. it joins a paragraph).
+// Split the source into lines. Each line is {t, nl}: t is the content
+// without its newline, nl says whether a newline followed it. A
+// whitespace-only line counts as blank only when terminated: a final
+// unterminated whitespace-only line is content (it joins a paragraph).
 function splitLines(src) {
   src = src.replace(/\r\n?/g, '\n');
   if (src === '') return [];
   const parts = src.split('\n');
   const endsNL = src.endsWith('\n');
   if (endsNL) parts.pop();
+  const last = parts.length - 1;
   const lines = new Array(parts.length);
   for (let i = 0; i < parts.length; i++) {
-    lines[i] = { t: parts[i], nl: i < parts.length - 1 || endsNL };
+    lines[i] = { t: parts[i], nl: i < last || endsNL };
   }
   return lines;
 }
 
-// Blank for continuing/ending a block: empty, or whitespace-only + terminated.
+// Blank for continuing or ending a block: empty, or whitespace-only and
+// terminated.
 function isBlankLine(L) {
   if (L.t === '') return true;
   if (!L.nl) return false;
