@@ -1570,6 +1570,12 @@ let inLinkGlobal = false;
 // to detect a link formed inside a strikethrough's recursive parse: a
 // bracket enclosing such a strikethrough can never form a link itself.
 let linksFormed = 0;
+// Extended autolinks (http/https/ftp/www) created during the current
+// parse() call, as {html, text} pairs. Used to revert autolinks formed
+// inside a strikethrough's recursive parse when the del ends up inside
+// a link (an https autolink's HTML is identical to an angle autolink's,
+// so only creation-time tracking can distinguish them).
+let extAutolinks = [];
 
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
 // separated by single dots, at least two labels. Returns the end index of
@@ -2023,6 +2029,10 @@ function parseInline(text, refs, plain) {
   // (closer at the end, optionally followed by letters). Such a del
   // blocks an enclosing ** strong match.
   const blockingDelsStrong = [];
+  // Extended autolinks formed inside each del's recursive parse, by
+  // the chunk index of the del's inner HTML chunk: [{chunk, ext}].
+  // When a link forms around the del, these are reverted to text.
+  const delExtAutolinks = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
   // run, emphasis delimiters are suppressed while a backtick remains
   // later in the text (not just until the next backtick run: a later
@@ -2260,6 +2270,7 @@ function parseInline(text, refs, plain) {
           if (crosses) { i = j; continue; }
           flushText(i);
           const linksBefore = linksFormed;
+          const extBefore = extAutolinks.length;
           const inner = parseInline(text.slice(j, closer), refs, plain);
           // A link formed inside the strikethrough blocks every
           // enclosing bracket from forming a link (links cannot
@@ -2268,6 +2279,12 @@ function parseInline(text, refs, plain) {
             for (const b of brackets) {
               if (b.active) b.linkBlocked = true;
             }
+          }
+          // Extended autolinks formed inside the del are recorded so
+          // a link forming around the del can revert them to text.
+          const delExt = extAutolinks.slice(extBefore);
+          if (delExt.length > 0) {
+            delExtAutolinks.push({ chunk: chunks.length + 1, ext: delExt });
           }
           // A del whose content ends with a blocking ** strong pair
           // (opener preceded by a space, closer at the end, optionally
@@ -2379,9 +2396,10 @@ function parseInline(text, refs, plain) {
         let href = null;
         let title = null;
         let endPos = -1;
+        let isInline = false;
         if (i + 1 < n && text[i + 1] === '(') {
           const il = parseInlineLink(text, i + 1);
-          if (il) { href = il.href; title = il.title; endPos = il.end; }
+          if (il) { href = il.href; title = il.title; endPos = il.end; isInline = true; }
           // A failed inline link falls back to the shortcut reference.
           if (href === null) {
             const label = normalizeLabel(linkTextRaw);
@@ -2405,9 +2423,10 @@ function parseInline(text, refs, plain) {
           if (ref) { href = ref.href; title = ref.title; endPos = i + 1; }
         }
         if (href !== null) {
-          // Unclosed backtick in link text suppresses later emphasis
-          // until the next backtick run (only when one exists later).
-          if (!br.isImage) {
+          // Unclosed backtick in an INLINE link's text suppresses
+          // later emphasis while a backtick remains later in the
+          // text. Reference/shortcut links do not suppress.
+          if (!br.isImage && isInline) {
             for (const tp of unclosedTicks) {
               if (tp > br.srcPos && tp < i &&
                   text.indexOf('`', endPos) !== -1) {
@@ -2443,6 +2462,19 @@ function parseInline(text, refs, plain) {
               if (ch.includes('<a href="http://')) {
                 chunks[cc] = ch.replace(
                   /<a href="http:\/\/([^"<]+)">\1<\/a>/g, '$1');
+              }
+            }
+            // Extended autolinks (incl. https) formed inside a del
+            // within this link are reverted via creation-time tracking
+            // (their HTML is identical to angle autolinks').
+            for (const de of delExtAutolinks) {
+              if (de.chunk > br.chunk && de.chunk < L) {
+                for (const e of de.ext) {
+                  if (chunks[de.chunk].includes(e.html)) {
+                    chunks[de.chunk] =
+                      chunks[de.chunk].split(e.html).join(e.text);
+                  }
+                }
               }
             }
             if (plain) {
@@ -2637,9 +2669,10 @@ function parseInline(text, refs, plain) {
         if (plain) pushChunk(esc(u.text), i);
         else {
           const chunkIdx = chunks.length;
-          pushChunk(
-            `<a href="${cleanUrl(u.href)}">${escapeNoEncode(u.text)}</a>`, i);
+          const aHtml = `<a href="${cleanUrl(u.href)}">${escapeNoEncode(u.text)}</a>`;
+          pushChunk(aHtml, i);
           autoLinks.push({ chunk: chunkIdx, raw: u.text, extended: true, reverted: false });
+          extAutolinks.push({ html: aHtml, text: escapeNoEncode(u.text) });
         }
         i = u.end;
         textStart = i;
@@ -2938,6 +2971,7 @@ function renderBlocks(blocks, refs, out) {
 export function parse(markdown) {
   inLinkGlobal = false;
   linksFormed = 0;
+  extAutolinks = [];
   const lines = splitLines(markdown);
   const refs = new Map();
   const blocks = parseBlocks(lines, refs);
