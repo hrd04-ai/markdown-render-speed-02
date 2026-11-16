@@ -2014,6 +2014,11 @@ function parseInline(text, refs, plain) {
   // parity exception: an odd run count is allowed when the link text
   // ends with a closed code span).
   const codeSpans = [];
+  // Chunk indices of <del> elements whose content ends with a blocking
+  // strong pair (a ** pair whose opener is preceded by a space and
+  // whose closer is at the end of the del content, optionally followed
+  // by letters). Such a del blocks an enclosing * em match.
+  const blockingDels = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
   // run, emphasis delimiters are suppressed while a backtick remains
   // later in the text (not just until the next backtick run: a later
@@ -2258,6 +2263,17 @@ function parseInline(text, refs, plain) {
           if (linksFormed > linksBefore) {
             for (const b of brackets) {
               if (b.active) b.linkBlocked = true;
+            }
+          }
+          // A del whose content ends with a blocking ** strong pair
+          // (opener preceded by a space, closer at the end, optionally
+          // followed by letters) blocks an enclosing * em match. A
+          // __ strong does not block (different delimiter char).
+          if (!plain && /<\/strong>[A-Za-z0-9]*$/.test(inner) &&
+              /\*\*[A-Za-z0-9]*$/.test(text.slice(j, closer))) {
+            const sIdx = inner.lastIndexOf('<strong>');
+            if (sIdx > 0 && inner[sIdx - 1] === ' ') {
+              blockingDels.push(chunks.length);
             }
           }
           if (!plain) pushChunk('<del>', i);
@@ -2720,6 +2736,16 @@ function parseInline(text, refs, plain) {
                   if (!blockedBy.includes(p)) blockedBy.push(p);
                   break;
                 }
+              }
+            }
+          }
+          // A blocking del (content ending in a strong pair) between
+          // the opener and closer also blocks the match.
+          if (!blocked) {
+            for (const dc of blockingDels) {
+              if (opener.chunk < dc && dc < closer.chunk) {
+                blocked = true;
+                break;
               }
             }
           }
