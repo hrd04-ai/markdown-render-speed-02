@@ -914,17 +914,20 @@ function looksLikeTableDelimiter(t) {
 // Block consumers
 // ---------------------------------------------------------------------------
 
+// Language of a fenced code block: the first whitespace-delimited word
+// of the info string, with backslash escapes resolved first
+// (``` foo\+bar -> language-foo+bar).
+function fenceLanguage(info) {
+  const trimmed = info.replace(/^[ \t]+|[ \t]+$/g, '');
+  if (trimmed === '') return '';
+  let end = 0;
+  while (end < trimmed.length && !isSpaceOrTab(trimmed[end])) end++;
+  return resolveEscapes(trimmed.slice(0, end));
+}
+
 // Fenced code block starting at lines[i] (match m).
 function consumeFence(lines, i, m) {
-  // Language: first whitespace-delimited word of the info string, with
-  // backslash escapes resolved first (``` foo\+bar -> language-foo+bar).
-  const info = m.info.replace(/^[ \t]+|[ \t]+$/g, '');
-  let lang = '';
-  if (info !== '') {
-    let e = 0;
-    while (e < info.length && !isSpaceOrTab(info[e])) e++;
-    lang = resolveEscapes(info.slice(0, e));
-  }
+  const lang = fenceLanguage(m.info);
   const content = [];
   let j = i + 1;
   while (j < lines.length) {
@@ -945,26 +948,29 @@ function consumeFence(lines, i, m) {
   return { block: { t: 'fence', lang, text }, next: j };
 }
 
+// Find the last line index of an HTML block starting at lines[i]:
+// types 1-5 run to the line holding the terminator (inclusive);
+// types 6-7 run to the line before the next blank line.
+function htmlBlockEnd(lines, i, m) {
+  const n = lines.length;
+  if (m.type <= 5) {
+    const end = m.end.toLowerCase();
+    let k = i;
+    while (k < n && lines[k].t.toLowerCase().indexOf(end) === -1) k++;
+    return k >= n ? n - 1 : k;
+  }
+  let k = i + 1;
+  while (k < n && !isBlankLine(lines[k])) k++;
+  return k - 1;
+}
+
 // HTML block starting at lines[i] (match m).
 function consumeHtml(lines, i, m) {
   const n = lines.length;
-  let k = i;
-  if (m.type <= 5) {
-    // Ends at the line containing the terminator (inclusive).
-    const end = m.end.toLowerCase();
-    while (k < n && lines[k].t.toLowerCase().indexOf(end) === -1) k++;
-    if (k >= n) k = n - 1;
-  } else {
-    // Types 6-7: ends at a blank line (or end of input).
-    k = i + 1;
-    while (k < n && !isBlankLine(lines[k])) k++;
-    k--;
-  }
-  let text = '';
-  for (let q = i; q <= k; q++) {
-    if (q > i) text += '\n';
-    text += lines[q].t;
-  }
+  const k = htmlBlockEnd(lines, i, m);
+  const parts = [];
+  for (let q = i; q <= k; q++) parts.push(lines[q].t);
+  let text = parts.join('\n');
   // Trailing newline rule:
   // - Types 1-5: include it iff the last line is terminated AND the next
   //   line is non-empty (or there is no next line).
@@ -973,8 +979,8 @@ function consumeHtml(lines, i, m) {
   const lastNL = lines[k].nl;
   if (m.type <= 5) {
     if (lastNL && (k + 1 >= n || lines[k + 1].t !== '')) text += '\n';
-  } else {
-    if (lastNL && k + 1 >= n) text += '\n';
+  } else if (lastNL && k + 1 >= n) {
+    text += '\n';
   }
   return { block: { t: 'html', text }, next: k + 1 };
 }
@@ -985,20 +991,25 @@ function consumeIndentedCode(lines, i) {
   let pendingBlanks = [];
   let j = i;
   let next = i;
+  // Move the pending blank lines into the content (they only join the
+  // block when a non-blank line follows them).
+  function flushBlanks() {
+    for (const b of pendingBlanks) content.push(b);
+    pendingBlanks = [];
+  }
   while (j < lines.length) {
     const L = lines[j];
     if (isBlankLine(L)) {
       // A whitespace-only line contributes the part after 4 columns
-      // (e.g. 6 spaces -> 2 spaces), not an empty line. It only joins
-      // the block when a non-blank line follows it.
+      // (e.g. 6 spaces -> 2 spaces), not an empty line.
       pendingBlanks.push(sliceFromCol(L.t, 4, false));
       j++;
       continue;
     }
     const [w] = leadingWs(L.t);
     if (w < 4) break;
-    content.push(...pendingBlanks, sliceFromCol(L.t, 4, false));
-    pendingBlanks = [];
+    flushBlanks();
+    content.push(sliceFromCol(L.t, 4, false));
     next = j + 1;
     j++;
   }
@@ -1011,124 +1022,154 @@ function consumeIndentedCode(lines, i) {
 // ---------------------------------------------------------------------------
 
 // Parse a title starting at text[i] (", ', or (). Returns {title, end}
-// (end = index after the closing delimiter) or null when unclosed/invalid.
-// isInline: inline-link paren titles allow '(' inside; def paren titles do not.
+// (end = the index after the closing delimiter) or null when the title
+// is unclosed or invalid. isInline: inline-link paren titles allow '('
+// inside; definition paren titles do not.
 function parseTitle(text, i, isInline) {
   const n = text.length;
   const q = text[i];
   const closer = q === '(' ? ')' : q;
   const allowOpen = q !== '(' || isInline;
-  let title = '';
+  const parts = [];
   let j = i + 1;
   while (j < n) {
     const c = text[j];
     if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
-      title += text[j + 1];
+      parts.push(text[j + 1]);
       j += 2;
       continue;
     }
-    if (c === closer) return { title, end: j + 1 };
+    if (c === closer) return { title: parts.join(''), end: j + 1 };
     if (c === '(' && !allowOpen) return null;
-    title += c;
+    parts.push(c);
     j++;
   }
   return null;
 }
 
 // Scan a link-definition label starting just after '['. Escapes stay RAW
-// in the label (for matching); an escaped \] does not end it and an
-// escaped \[ does not invalidate it. Returns {label, end} (end = index
-// after ']') or null.
+// in the label (for matching): an escaped \] does not end it, and an
+// escaped \[ does not invalidate it. Returns {label, end} (end = the
+// index after ']') or null.
 function scanDefLabel(text, i) {
   const n = text.length;
-  let label = '';
+  const parts = [];
   while (i < n) {
     const c = text[i];
     if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-      label += text[i] + text[i + 1];
+      parts.push(text[i], text[i + 1]);
       i += 2;
       continue;
     }
     if (c === '[') return null;
-    if (c === ']') return { label, end: i + 1 };
-    label += c;
+    if (c === ']') return { label: parts.join(''), end: i + 1 };
+    parts.push(c);
     i++;
   }
   return null;
 }
 
-// Skip the gap after ':' in a link definition: spaces, optionally one
-// newline + spaces/tabs. Returns the index after the gap, or -1 when a
-// second newline follows.
+// Skip the gap after ':' in a link definition: spaces, then optionally
+// one newline plus spaces/tabs. Returns the index after the gap, or -1
+// when a second newline follows.
 function skipDefGap(text, i) {
   const n = text.length;
   while (i < n && text[i] === ' ') i++;
-  if (i < n && text[i] === '\n') {
-    i++;
-    while (i < n && isSpaceOrTab(text[i])) i++;
-    if (i < n && text[i] === '\n') return -1;
-  }
+  if (i >= n || text[i] !== '\n') return i;
+  i++;
+  while (i < n && isSpaceOrTab(text[i])) i++;
+  if (i < n && text[i] === '\n') return -1;
   return i;
 }
 
-// Scan a link destination starting at text[i]. Angle form <...> (no
-// newlines, no '<' inside, escapes resolved) or bare form (balanced
-// parens, no spaces/control chars, escapes resolved). Returns
-// {dest, end} or null. A bare empty destination is invalid unless
-// allowEmpty is set (inline links allow [a]()).
-function scanLinkDest(text, i, allowEmpty) {
+// Scan an angle-form destination <...> starting at text[i] ('<'): no
+// newlines, no '<' inside, escapes resolved. Returns {dest, end} or null.
+function scanAngleDest(text, i) {
   const n = text.length;
-  if (text[i] === '<') {
-    let dest = '';
-    i++;
-    while (i < n) {
-      const c = text[i];
-      if (c === '\n' || c === '<') return null;
-      if (c === '>') return { dest, end: i + 1 };
-      if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-        dest += text[i + 1];
-        i += 2;
-      } else {
-        dest += c;
-        i++;
-      }
+  const parts = [];
+  let j = i + 1;
+  while (j < n) {
+    const c = text[j];
+    if (c === '\n' || c === '<') return null;
+    if (c === '>') return { dest: parts.join(''), end: j + 1 };
+    if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
+      parts.push(text[j + 1]);
+      j += 2;
+    } else {
+      parts.push(c);
+      j++;
     }
-    return null;
   }
-  let dest = '';
+  return null;
+}
+
+// Scan a bare-form destination starting at text[i]: balanced parens, no
+// spaces or control characters, escapes resolved. Returns {dest, end} or
+// null. An empty destination is invalid unless allowEmpty is set
+// (inline links allow [a]()).
+function scanBareDest(text, i, allowEmpty) {
+  const n = text.length;
+  const parts = [];
   let depth = 0;
-  while (i < n) {
-    const c = text[i];
-    if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-      dest += text[i + 1];
-      i += 2;
+  let j = i;
+  while (j < n) {
+    const c = text[j];
+    if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
+      parts.push(text[j + 1]);
+      j += 2;
       continue;
     }
     if (c === '(') {
       depth++;
-      dest += c;
-      i++;
+      parts.push(c);
+      j++;
       continue;
     }
     if (c === ')') {
       if (depth === 0) break;
       depth--;
-      dest += c;
-      i++;
+      parts.push(c);
+      j++;
       continue;
     }
     const code = c.charCodeAt(0);
     if (c === ' ' || c === '\t' || c === '\n' || code < 0x20) break;
-    dest += c;
-    i++;
+    parts.push(c);
+    j++;
   }
+  const dest = parts.join('');
   if ((dest === '' && !allowEmpty) || depth !== 0) return null;
-  return { dest, end: i };
+  return { dest, end: j };
 }
 
-// Parse a link reference definition from the start of text (joined paragraph
-// text). Returns {consumed, label, href, title} or null. consumed covers the
-// definition plus its trailing newline when present.
+// Scan a link destination starting at text[i]: angle form <...> or bare
+// form. Returns {dest, end} or null.
+function scanLinkDest(text, i, allowEmpty) {
+  if (text[i] === '<') return scanAngleDest(text, i);
+  return scanBareDest(text, i, allowEmpty);
+}
+
+// Is this character a title opener (double quote, single quote, or paren)?
+function isTitleOpener(c) {
+  return c === '"' || c === "'" || c === '(';
+}
+
+// Parse a definition title at text[q], which must hold ", ' or (.
+// Returns {title, end} (end = the index after the title plus its trailing
+// spaces/tabs), or null when the title is unclosed or junk follows it.
+function parseDefTitleAt(text, q) {
+  const tr = parseTitle(text, q, false);
+  if (!tr) return null;
+  const n = text.length;
+  let r = tr.end;
+  while (r < n && isSpaceOrTab(text[r])) r++;
+  if (r < n && text[r] !== '\n') return null;
+  return { title: tr.title, end: r };
+}
+
+// Parse a link reference definition from the start of text (joined
+// paragraph text). Returns {consumed, label, href, title} or null.
+// consumed covers the definition plus its trailing newline when present.
 function parseLinkDef(text) {
   const n = text.length;
   let i = 0;
@@ -1147,46 +1188,40 @@ function parseLinkDef(text) {
   if (!d) return null;
   const dest = d.dest;
   i = d.end;
-  // Optional title: same line (after spaces) or next line (after newline).
-  // A same-line title needs at least one space before it, and a failed
-  // same-line title kills the whole definition. A failed next-line title
-  // leaves the definition valid without the title.
+  // Optional title: same line (after spaces) or next line (after a
+  // newline). A same-line title needs at least one space before it, and
+  // a failed same-line title kills the whole definition. A failed
+  // next-line title leaves the definition valid without the title.
   let p = i;
   let gapSpaces = 0;
   while (p < n && text[p] === ' ') { p++; gapSpaces++; }
   if (p < n && text[p] === '\n') {
+    const consumedNoTitle = p + 1;
     let q = p + 1;
     while (q < n && isSpaceOrTab(text[q])) q++;
-    if (q < n && text[q] !== '\n' &&
-        (text[q] === '"' || text[q] === "'" || text[q] === '(')) {
-      const tr = parseTitle(text, q, false);
-      if (tr) {
-        let r = tr.end;
-        while (r < n && isSpaceOrTab(text[r])) r++;
-        if (r >= n || text[r] === '\n') {
-          return {
-            consumed: r < n ? r + 1 : r,
-            label: normLabel, href: dest, title: tr.title,
-          };
-        }
+    if (q < n && text[q] !== '\n' && isTitleOpener(text[q])) {
+      const titled = parseDefTitleAt(text, q);
+      if (titled) {
+        const r = titled.end;
+        return {
+          consumed: r < n ? r + 1 : r,
+          label: normLabel, href: dest, title: titled.title,
+        };
       }
-      // Next-line title invalid: definition without the title survives.
+      // Next-line title invalid: the definition survives without it.
     }
     return {
-      consumed: p < n ? p + 1 : p,
+      consumed: consumedNoTitle,
       label: normLabel, href: dest, title: null,
     };
   }
-  if (gapSpaces > 0 && p < n &&
-      (text[p] === '"' || text[p] === "'" || text[p] === '(')) {
-    const tr = parseTitle(text, p, false);
-    if (!tr) return null;
-    p = tr.end;
-    while (p < n && isSpaceOrTab(text[p])) p++;
-    if (p < n && text[p] !== '\n') return null;
+  if (gapSpaces > 0 && p < n && isTitleOpener(text[p])) {
+    const titled = parseDefTitleAt(text, p);
+    if (!titled) return null;
+    const r = titled.end;
     return {
-      consumed: p < n ? p + 1 : p,
-      label: normLabel, href: dest, title: tr.title,
+      consumed: r < n ? r + 1 : r,
+      label: normLabel, href: dest, title: titled.title,
     };
   }
   if (p < n && text[p] !== '\n') return null;
