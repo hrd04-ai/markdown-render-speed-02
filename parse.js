@@ -2529,6 +2529,49 @@ function parseInline(text, refs, plain) {
     }
     return false;
   }
+  // Index of the last active (unclosed) bracket, or -1 when there is none.
+  function lastActiveBracketIndex() {
+    let bi = brackets.length - 1;
+    while (bi >= 0 && !brackets[bi].active) bi--;
+    return bi;
+  }
+  // Record a new bracket (link or image) in the bracket stack.
+  function pushBracket(chunk, bangChunk, srcPos, isImage) {
+    brackets.push({
+      chunk, bangChunk, srcPos, isImage, active: true,
+      closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
+      linkBlocked: false,
+    });
+  }
+  // Is there an unmatched '_' opener that can open emphasis? When one
+  // exists, trailing '_'s in an email domain or URL are emphasis
+  // delimiters (trimmed), not domain characters.
+  function hasUnmatchedUnderscoreOpener() {
+    for (const d of delims) {
+      if (!d.dead && d.ch === '_' && d.canOpen) return true;
+    }
+    return false;
+  }
+  // Update the document-global in-link state for one inline HTML tag
+  // spanning text[i..he): the exact tag "</a>" clears it; an "<a" open
+  // tag whose name is followed by a literal space sets it.
+  function updateInLinkState(i, he) {
+    if (he - i === 4 && text[i + 1] === '/' &&
+        (text[i + 2] === 'a' || text[i + 2] === 'A') &&
+        text[i + 3] === '>') {
+      inLinkGlobal = false;
+    } else if ((text[i + 1] === 'a' || text[i + 1] === 'A') &&
+        text[i + 2] === ' ') {
+      inLinkGlobal = true;
+    }
+  }
+  // Count the spaces immediately before position i, back to textStart.
+  function countTrailingSpaces(i) {
+    let sp = 0;
+    let k = i - 1;
+    while (k >= textStart && text[k] === ' ') { sp++; k--; }
+    return sp;
+  }
 
   while (i < n) {
     const c = text[i];
@@ -2580,8 +2623,7 @@ function parseInline(text, refs, plain) {
         }
         if (ch === '[') { depth++; k++; continue; }
         if (ch === ']' && depth === 0) {
-          let bi = brackets.length - 1;
-          while (bi >= 0 && !brackets[bi].active) bi--;
+          const bi = lastActiveBracketIndex();
           if (bi >= 0) {
             // Count backtick runs in the bracket text.
             let ticks = 0;
@@ -2783,11 +2825,7 @@ function parseInline(text, refs, plain) {
       pushChunk('!', i);
       const brChunk = chunks.length;
       pushChunk('[', i + 1);
-      brackets.push({
-        chunk: brChunk, bangChunk, srcPos: i + 1, isImage: true, active: true,
-        closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
-        linkBlocked: false,
-      });
+      pushBracket(brChunk, bangChunk, i + 1, true);
       i += 2;
       textStart = i;
       continue;
@@ -2797,19 +2835,14 @@ function parseInline(text, refs, plain) {
       flushText(i);
       const brChunk = chunks.length;
       pushChunk('[', i);
-      brackets.push({
-        chunk: brChunk, bangChunk: -1, srcPos: i, isImage: false, active: true,
-        closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
-        linkBlocked: false,
-      });
+      pushBracket(brChunk, -1, i, false);
       i++;
       textStart = i;
       continue;
     }
     // Close bracket: try to form a link/image.
     if (c === ']') {
-      let bi = brackets.length - 1;
-      while (bi >= 0 && !brackets[bi].active) bi--;
+      const bi = lastActiveBracketIndex();
       if (bi >= 0) {
         const br = brackets[bi];
         // Balance check: the text must have equal '[' and ']' counts.
@@ -3038,14 +3071,7 @@ function parseInline(text, refs, plain) {
         // An inline <a> tag sets the document-global in-link state
         // (suppresses extended autolinks); the exact tag "</a>" clears
         // it. The open tag needs a literal space after the name.
-        if (he - i === 4 && text[i + 1] === '/' &&
-            (text[i + 2] === 'a' || text[i + 2] === 'A') &&
-            text[i + 3] === '>') {
-          inLinkGlobal = false;
-        } else if ((text[i + 1] === 'a' || text[i + 1] === 'A') &&
-            text[i + 2] === ' ') {
-          inLinkGlobal = true;
-        }
+        updateInLinkState(i, he);
         i = he;
         textStart = i;
         continue;
@@ -3053,24 +3079,23 @@ function parseInline(text, refs, plain) {
       i++;
       continue;
     }
-    // Entities.
+    // Entities: a valid entity reference renders as its character(s);
+    // anything else leaves the '&' as literal text.
     if (c === '&') {
       const ent = matchEntity(text, i);
-      if (ent) {
-        flushText(i);
-        pushChunk(ent.out, i);
-        i += ent.len;
-        textStart = i;
+      if (!ent) {
+        i++;
         continue;
       }
-      i++;
+      flushText(i);
+      pushChunk(ent.out, i);
+      i += ent.len;
+      textStart = i;
       continue;
     }
     // Newlines: hard breaks (2+ trailing spaces) or soft breaks.
     if (c === '\n') {
-      let sp = 0;
-      let k = i - 1;
-      while (k >= textStart && text[k] === ' ') { sp++; k--; }
+      const sp = countTrailingSpaces(i);
       if (sp >= 2) {
         flushText(i - sp);
         if (!plain) pushChunk('<br>', i);
@@ -3087,17 +3112,13 @@ function parseInline(text, refs, plain) {
     // inline <a> tag earlier in the document).
     if (!inLinkGlobal && (c === 'w' || c === 'h' || c === 'H' || c === 'f' ||
         c === 'F' || c === 'm' || c === 'x')) {
-      let trimUs = false;
-      for (const d of delims) {
-        if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
-      }
+      const trimUs = hasUnmatchedUnderscoreOpener();
       let u = matchExtendedUrl(text, i, trimUs);
       // If the URL swallowed a ']' that closes an active bracket AND a link
       // will form from that ']', truncate the URL to before the ']'
       // (otherwise the ']' is part of the URL and no link forms).
       if (u && u.text.includes(']')) {
-        let bi = brackets.length - 1;
-        while (bi >= 0 && !brackets[bi].active) bi--;
+        const bi = lastActiveBracketIndex();
         if (bi >= 0) {
           const closePos = i + u.text.indexOf(']');
           const after = text[closePos + 1];
@@ -3146,10 +3167,7 @@ function parseInline(text, refs, plain) {
     if (c === '@' && !inLinkGlobal) {
       // If an unmatched '_' opener exists, trailing '_'s in the domain
       // are emphasis delimiters (trimmed), not domain characters.
-      let trimUs = false;
-      for (const d of delims) {
-        if (!d.dead && d.ch === '_' && d.canOpen) { trimUs = true; break; }
-      }
+      const trimUs = hasUnmatchedUnderscoreOpener();
       const em = matchEmail(text, i, textStart, trimUs);
       if (em) {
         flushText(em.start);
