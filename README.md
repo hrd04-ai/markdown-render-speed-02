@@ -48,9 +48,9 @@ single process, and the median wall-clock totals are compared.
 Correctness is checked first: every case must be byte-identical to
 marked's output before the timing counts.
 
-Result on this machine (Node 22, median of 5 runs): **720/720
-byte-identical**, and the entry runs **1.89× faster** than marked
-(514 ms vs 972 ms for the whole set). The speed comes from the
+Result on this machine (Node 22, median of 5 runs on the final code):
+**720/720 byte-identical**, and the entry runs **1.66× faster** than
+marked (601 ms vs 999 ms for the whole set). The speed comes from the
 single-pass inline walk, cheap character-class checks (code-point ranges
 instead of regexes on the hot path), and rendering straight into a chunk
 array instead of building an AST.
