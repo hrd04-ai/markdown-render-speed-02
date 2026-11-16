@@ -114,6 +114,57 @@ A few choices shape the whole parser:
   chunk array that is joined once at the end. Blocks are the only tree,
   and it is shallow: paragraphs, headings, code, quotes, lists, tables.
 
+## Quirks catalog
+
+Marked 18.1.3 does not implement CommonMark 0.31.2 exactly, and this
+parser matches marked, quirks included. The ones that cost the most
+debugging time, all pinned by probing marked's outputs (never its
+source):
+
+- **Fence indent stripping is backtick-only.** Content lines of a
+  backtick fence lose the opening fence's indent; tilde-fence content
+  keeps its indent verbatim. Tabs count as one column when stripping.
+- **The `<a>` in-link state is document-global.** An inline `<a>` open
+  tag whose name is followed by a literal space sets a flag that
+  suppresses extended autolinks (www/http/email) for the rest of the
+  document, across blocks, until the exact 4-character tag `</a>` (any
+  case) clears it. A tab, newline, `>` or `/` after the name does not
+  set it; `</a >` does not clear it. Tags inside HTML blocks, code
+  spans, or link text do not touch the state.
+- **Lazy setext and delimiter lines never convert.** Inside a
+  blockquote, a lazy line that looks like a setext underline or a table
+  delimiter row stays paragraph text — even when the paragraph it
+  continues is otherwise a perfect setext heading or table header.
+- **A terminated `   \t` line is a table body row.** A line of 0–3
+  spaces plus a single tab, terminated by a newline, produces an empty
+  table row instead of ending the table. Unterminated, it is blank.
+- **List items swallow fence content.** While a fence inside a list
+  item is open and already has a content line, under-indented lines
+  that are not fence lines stay in the item as fence content — unless
+  the previous item line could start a leaf block (indented code, ATX,
+  HR, HTML block). If the first line after the fence open is
+  under-indented, the item ends and the fence is empty.
+- **Paragraph continuations inside list items lose 4 columns.** A
+  continuation line with 4+ columns of leading whitespace is stripped
+  by 4; a non-stripped continuation following a stripped one is
+  preceded by a blank line inside the paragraph.
+- **Link definitions are paragraph-scoped, first wins.** Definitions
+  are extracted from the start of paragraph text (possibly spanning
+  lines), the first definition of a label wins, and a paragraph that
+  turns out to be only definitions produces no block at all — a setext
+  or table line after it then starts a fresh block.
+- **Emphasis has a rule of 3 and a del interaction.** The CommonMark
+  rule of 3 applies (odd/even length interplay between opener and
+  closer), `_` cannot open or close intraword, and a strikethrough
+  ending in a `*` emphasis blocks an enclosing `**` strong match until
+  one closer fails against it.
+- **Extended autolinks are picky about context.** `www.` needs a
+  restricted preceding character and a lowercase literal; `mailto:` and
+  `xmpp:` need a non-word preceding character; `http(s)://` and `ftp://`
+  are case-insensitive with no preceding restriction. Trailing
+  punctuation, named entities, and unmatched `)` are trimmed from the
+  candidate, and paren groups pair non-nested.
+
 ## Testing
 
 - Practice set: the kit's harness renders all 720 cases with this
