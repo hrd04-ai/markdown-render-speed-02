@@ -2605,12 +2605,14 @@ function parseInline(text, refs, plain) {
   // Emphasis resolution (delimiter stack, CommonMark rules + scope isolation).
   // Matched single-delimiter (em) spans, for the cross-pair blocking rule.
   const emSpans = [];
-  // Matched strong (use-2) pairs [openerIdx, closerIdx], for the blocking
-  // rule below.
+  // Matched strong (use-2) pairs, for the blocking rule below. Each
+  // pair counts closers that failed against it; two failures lift it.
   const strongPairs = [];
   for (let di = 0; di < delims.length; di++) {
     const closer = delims[di];
     if (closer.dead || closer.len === 0 || !closer.canClose) continue;
+    const startLen = closer.len;
+    const blockedBy = [];
     let oi = di - 1;
     while (oi >= 0 && closer.len > 0) {
       const opener = delims[oi];
@@ -2640,13 +2642,30 @@ function parseInline(text, refs, plain) {
         // whose opener cannot close blocks matches across it — unless
         // the closer run has length >= 3 or the match uses 2 (strong).
         // Pairs already enclosed in a matched span (dead) don't block.
+        // The block lifts after two closers fail against it, or once
+        // the first '*' delimiter after the pair is used up.
         if (closer.ch === '*' && !(closer.len >= 3 || use === 2)) {
           let blocked = false;
           for (const p of strongPairs) {
-            if (oi < p[0] && p[1] < di) {
-              const pop = delims[p[0]], pcl = delims[p[1]];
+            if (p.fails >= 2) continue;
+            if (oi < p.oi && p.di < di) {
+              const pop = delims[p.oi], pcl = delims[p.di];
               if (!pop.dead && !pcl.dead && pcl.canOpen && !pop.canClose &&
-                  pop.ch === '*') { blocked = true; break; }
+                  pop.ch === '*') {
+                let firstUsed = false;
+                for (let k = p.di + 1; k < di; k++) {
+                  if (delims[k].ch === '*') {
+                    firstUsed =
+                      delims[k].len === 0 || delims[k].dead;
+                    break;
+                  }
+                }
+                if (!firstUsed) {
+                  blocked = true;
+                  if (!blockedBy.includes(p)) blockedBy.push(p);
+                  break;
+                }
+              }
             }
           }
           if (blocked) { oi--; continue; }
@@ -2655,7 +2674,7 @@ function parseInline(text, refs, plain) {
         closer.len -= use;
         if (use === 1 && closer.canOpen) emSpans.push([oi, di, closer.ch]);
         if (use === 2) {
-          strongPairs.push([oi, di]);
+          strongPairs.push({ oi, di, fails: 0 });
           // A recorded em span between the opener and closer moves the
           // closer's leftover literals inside the strong element.
           for (const s of emSpans) {
@@ -2677,6 +2696,19 @@ function parseInline(text, refs, plain) {
         continue;
       }
       oi--;
+    }
+    // A closer that matched nothing because strong pairs blocked it
+    // counts as a failure against each blocking pair. The second
+    // failure lifts the block — and a can-both closer that fails
+    // this second time is dead as an opener too (it cannot open for
+    // a later closer, which then matches across the pair instead).
+    if (closer.len === startLen && blockedBy.length > 0) {
+      let lifted = false;
+      for (const p of blockedBy) {
+        p.fails++;
+        if (p.fails >= 2) lifted = true;
+      }
+      if (lifted && closer.canOpen) closer.dead = true;
     }
   }
 
