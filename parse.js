@@ -321,57 +321,54 @@ function normalizeLabel(raw) {
 // Tabs, columns and lines
 // ---------------------------------------------------------------------------
 
-// How many columns a tab occupies when it starts at column `col`.
+// Width in columns of a tab that starts at column `col`: tabs stop
+// every 4 columns, so the width is the distance to the next stop.
 function tabWidth(col) {
-  return 4 - (col % 4);
+  return 4 - (col & 3);
 }
 
-// Measure the leading whitespace of a line: [width in columns, index of
-// the first non-whitespace character].
+// Measure a line's leading whitespace: [its width in columns, the index
+// of the first character that is not a space or tab].
 function leadingWs(line) {
   let col = 0;
   let i = 0;
-  while (i < line.length) {
+  for (; i < line.length; i++) {
     const c = line[i];
-    if (c === ' ') {
-      col++;
-      i++;
-    } else if (c === '\t') {
-      col += tabWidth(col);
-      i++;
-    } else break;
+    if (c === ' ') col += 1;
+    else if (c === '\t') col += tabWidth(col);
+    else break;
   }
   return [col, i];
 }
 
-// Expand the leading whitespace of a string to spaces, starting at column
-// startCol. Tabs become the spaces they would occupy; the rest of the
-// string is returned unchanged.
+// Expand the leading whitespace of a string into spaces, starting at
+// column startCol: each tab becomes the spaces it would occupy, and the
+// rest of the string comes back unchanged.
 function expandLeadingWs(s, startCol) {
   let col = startCol;
   let i = 0;
-  let out = '';
+  const spaces = [];
   while (i < s.length) {
     const c = s[i];
     if (c === '\t') {
       const w = tabWidth(col);
-      out += ' '.repeat(w);
+      spaces.push(' '.repeat(w));
       col += w;
       i++;
     } else if (c === ' ') {
-      out += ' ';
-      col++;
+      spaces.push(' ');
+      col += 1;
       i++;
     } else break;
   }
-  return out + s.slice(i);
+  return spaces.join('') + s.slice(i);
 }
 
-// Slice a line from a target column. A tab straddling the boundary turns
-// into spaces for the part past the boundary. With expandTabs, tabs in
-// the leading whitespace after the cut expand to spaces using the
-// original columns (container-prefix stripping); otherwise they are kept
-// verbatim (code content).
+// Slice a line from a target column. A tab straddling the boundary
+// becomes spaces for the part past it. With expandTabs set, tabs in the
+// leading whitespace after the cut expand to spaces using the original
+// columns (container-prefix stripping); otherwise they stay verbatim
+// (code content).
 function sliceFromCol(line, targetCol, expandTabs) {
   let col = 0;
   let i = 0;
@@ -383,78 +380,78 @@ function sliceFromCol(line, targetCol, expandTabs) {
       if (col + w <= targetCol) {
         col += w;
         i++;
-      } else {
-        prefix = ' '.repeat(col + w - targetCol);
-        col += w;
-        i++;
-        break;
+        continue;
       }
-    } else {
-      col++;
+      prefix = ' '.repeat(col + w - targetCol);
+      col += w;
       i++;
+      break;
     }
+    col++;
+    i++;
   }
-  if (!expandTabs) return prefix + line.slice(i);
-  return prefix + expandLeadingWs(line.slice(i), col);
+  const rest = line.slice(i);
+  if (!expandTabs) return prefix + rest;
+  return prefix + expandLeadingWs(rest, col);
 }
 
 // Is this string empty or whitespace-only (spaces/tabs)?
 function isBlankStart(t) {
   for (let i = 0; i < t.length; i++) {
-    const c = t[i];
-    if (c !== ' ' && c !== '\t') return false;
+    const cp = t.charCodeAt(i);
+    if (cp !== 0x20 && cp !== 0x09) return false;
   }
   return true;
 }
 
-// Split the source into lines. Each line is {t, nl}: t is the content
-// without its newline, nl says whether a newline followed it. A
-// whitespace-only line counts as blank only when terminated: a final
+// Split the source into lines. Each line is {t, nl}: t holds the content
+// without its newline, nl records whether a newline followed it. A
+// whitespace-only line counts as blank only when terminated — a final
 // unterminated whitespace-only line is content (it joins a paragraph).
 function splitLines(src) {
-  src = src.replace(/\r\n?/g, '\n');
-  if (src === '') return [];
-  const parts = src.split('\n');
-  const endsNL = src.endsWith('\n');
-  if (endsNL) parts.pop();
-  const last = parts.length - 1;
-  const lines = new Array(parts.length);
+  const unified = src.replace(/\r\n?/g, '\n');
+  if (unified === '') return [];
+  const terminated = unified.endsWith('\n');
+  const parts = unified.split('\n');
+  if (terminated) parts.pop();
+  const lastIdx = parts.length - 1;
+  const lines = [];
   for (let i = 0; i < parts.length; i++) {
-    lines[i] = { t: parts[i], nl: i < last || endsNL };
+    lines.push({ t: parts[i], nl: i < lastIdx || terminated });
   }
   return lines;
 }
 
-// Blank for continuing or ending a block: empty, or whitespace-only and
-// terminated.
+// Blank for continuing or ending a block: an empty line, or a
+// whitespace-only line that is terminated.
 function isBlankLine(L) {
   if (L.t === '') return true;
-  if (!L.nl) return false;
-  return isBlankStart(L.t);
+  return L.nl && isBlankStart(L.t);
 }
 
 // ---------------------------------------------------------------------------
 // Block-start matchers (each takes a raw line string)
 // ---------------------------------------------------------------------------
 
-// Skip up to 3 leading spaces. Returns the index after them, or -1 when
-// the next character is a tab (a tab reaches column 4, so the line cannot
-// start a block that allows at most 3 leading spaces).
+// Skip up to 3 leading spaces and return the index after them. Returns
+// -1 when the next character is a tab: a tab reaches column 4, so the
+// line cannot open a block that allows at most 3 leading spaces.
 function skipUpTo3Spaces(t) {
   let i = 0;
-  while (i < t.length && t[i] === ' ' && i < 3) i++;
+  while (i < 3 && i < t.length && t[i] === ' ') i++;
   if (i < t.length && t[i] === '\t') return -1;
   return i;
 }
 
-// Fenced code start. Returns {ch, len, indent, info} or null.
-// A backtick fence whose info string contains a backtick is not a fence.
+// Fenced code start. Returns {ch, len, indent, info} or null. A backtick
+// fence whose info string holds a backtick is not a fence at all.
 function matchFence(t) {
   const i = skipUpTo3Spaces(t);
-  if (i === -1 || i >= t.length) return null;
+  if (i === -1) return null;
+  if (i >= t.length) return null;
   const ch = t[i];
   if (ch !== '`' && ch !== '~') return null;
-  let j = i;
+  let j = i + 1;
   while (j < t.length && t[j] === ch) j++;
   const len = j - i;
   if (len < 3) return null;
@@ -464,7 +461,7 @@ function matchFence(t) {
 }
 
 // Is this line a closing fence for a fence of (ch, len)? Same character,
-// a run at least len long, only spaces/tabs after, 0-3 leading spaces.
+// a run at least len long, only spaces/tabs after it, 0-3 leading spaces.
 function isClosingFence(t, ch, len) {
   const k = skipUpTo3Spaces(t);
   if (k === -1 || k >= t.length) return false;
@@ -472,72 +469,77 @@ function isClosingFence(t, ch, len) {
   while (r < t.length && t[r] === ch) r++;
   if (r - k < len) return false;
   for (let q = r; q < t.length; q++) {
-    if (!isSpaceOrTab(t[q])) return false;
+    if (t[q] !== ' ' && t[q] !== '\t') return false;
   }
   return true;
 }
 
-// ATX heading. Returns {level, text} or null. The level is capped at 6
-// by the scan itself; a '#' run must be followed by space/tab or EOL.
+// ATX heading. Returns {level, text} or null. The scan itself caps the
+// level at 6; a '#' run must be followed by space/tab or end of line.
 function matchATX(t) {
   const i = skipUpTo3Spaces(t);
   if (i === -1 || i >= t.length) return null;
-  let j = i;
-  while (j < t.length && t[j] === '#' && j - i < 6) j++;
-  const level = j - i;
+  let openEnd = i;
+  while (openEnd < t.length && t[openEnd] === '#' && openEnd - i < 6) openEnd++;
+  const level = openEnd - i;
   if (level === 0) return null;
-  if (j < t.length && !isSpaceOrTab(t[j])) return null;
-  // Content: skip whitespace, trim trailing whitespace, strip a closing
-  // run of '#'s when it is preceded by space/tab. The preceding space
-  // may be the whitespace between the opening hashes and the content
-  // (e.g. "# #" is an empty heading).
-  let s = j;
-  while (s < t.length && isSpaceOrTab(t[s])) s++;
-  let e = t.length;
-  while (e > s && isSpaceOrTab(t[e - 1])) e--;
-  let k = e;
-  while (k > s && t[k - 1] === '#') k--;
-  if (k < e && k > j && isSpaceOrTab(t[k - 1])) {
-    e = k;
-    while (e > s && isSpaceOrTab(t[e - 1])) e--;
+  if (openEnd < t.length && !isSpaceOrTab(t[openEnd])) return null;
+  // Content: skip the whitespace, trim trailing whitespace, then strip
+  // a closing run of '#'s when a space/tab precedes it. That preceding
+  // space may be the gap between the opening hashes and the content
+  // (so "# #" is an empty heading).
+  let contentStart = openEnd;
+  while (contentStart < t.length && isSpaceOrTab(t[contentStart])) contentStart++;
+  let contentEnd = t.length;
+  while (contentEnd > contentStart && isSpaceOrTab(t[contentEnd - 1])) contentEnd--;
+  let hashStart = contentEnd;
+  while (hashStart > contentStart && t[hashStart - 1] === '#') hashStart--;
+  if (hashStart < contentEnd && hashStart > openEnd && isSpaceOrTab(t[hashStart - 1])) {
+    contentEnd = hashStart;
+    while (contentEnd > contentStart && isSpaceOrTab(t[contentEnd - 1])) contentEnd--;
   }
-  return { level, text: t.slice(s, e) };
+  return { level, text: t.slice(contentStart, contentEnd) };
 }
 
-// Thematic break: 3+ of the same marker (*, -, _) with only spaces/tabs.
+// Thematic break: three or more of one marker (*, -, _) with nothing
+// but spaces and tabs around them.
 function matchHR(t) {
   const i = skipUpTo3Spaces(t);
   if (i === -1 || i >= t.length) return false;
   const ch = t[i];
   if (ch !== '*' && ch !== '-' && ch !== '_') return false;
-  let count = 0;
-  for (let j = i; j < t.length; j++) {
+  let markers = 0;
+  for (let j = i + 1; j < t.length; j++) {
     const c = t[j];
-    if (c === ch) count++;
-    else if (!isSpaceOrTab(c)) return false;
+    if (c === ch) markers++;
+    else if (c !== ' ' && c !== '\t') return false;
   }
-  return count >= 3;
+  return markers + 1 >= 3;
 }
 
-// Setext underline: 1+ '=' or '-' with only trailing spaces/tabs.
-// Returns 1 (=), 2 (-), or 0. No internal spaces: '= =' and '--- -'
-// are NOT setext underlines.
+// Setext underline: one or more '=' or '-' with only trailing
+// spaces/tabs. Returns 1 for '=', 2 for '-', 0 otherwise. No internal
+// spaces are allowed: '= =' and '--- -' are NOT setext underlines.
 function matchSetext(t) {
   const i = skipUpTo3Spaces(t);
   if (i === -1 || i >= t.length) return 0;
   const ch = t[i];
   if (ch !== '=' && ch !== '-') return 0;
-  let j = i;
+  let j = i + 1;
   while (j < t.length && t[j] === ch) j++;
-  for (; j < t.length; j++) {
+  while (j < t.length) {
     if (!isSpaceOrTab(t[j])) return 0;
+    j++;
   }
   return ch === '=' ? 1 : 2;
 }
 
-// Blockquote prefix. Returns the rest of the line (leading tabs expanded
-// using original columns) or null when the line has no quote marker.
-function matchBlockquote(t) {
+// Scan up to 3 columns of leading spaces. Returns [col, i] (the column
+// reached and the index after the spaces), or null when a tab appears
+// first: a tab reaches column 4, so the line cannot open a block that
+// allows at most 3 leading spaces. Shared by the blockquote and list
+// matchers, which scan their indent the same way.
+function scanIndent3(t) {
   let col = 0;
   let i = 0;
   while (i < t.length && col < 3) {
@@ -546,14 +548,25 @@ function matchBlockquote(t) {
       col++;
       i++;
     } else if (c === '\t') {
-      return null; // a tab reaches column 4: not a quote
-    } else break;
+      return null;
+    } else {
+      break;
+    }
   }
+  return [col, i];
+}
+
+// Blockquote prefix. Returns the rest of the line (leading tabs expanded
+// using the original columns), or null when the line has no quote marker.
+function matchBlockquote(t) {
+  const scanned = scanIndent3(t);
+  if (scanned === null) return null;
+  let [col, i] = scanned;
   if (i >= t.length || t[i] !== '>') return null;
   i++;
   col++;
   // One optional space after '>'; a tab there counts as one column and
-  // the rest of its width becomes spaces.
+  // the rest of its width turns into spaces.
   let prefix = '';
   if (i < t.length) {
     const c = t[i];
@@ -576,19 +589,10 @@ function matchBlockquote(t) {
 //  content (string after marker + whitespace, tabs expanded),
 //  empty (no content on this line)}
 function matchListMarker(t) {
-  let col = 0;
-  let i = 0;
-  while (i < t.length && col < 3) {
-    const c = t[i];
-    if (c === ' ') {
-      col++;
-      i++;
-    } else if (c === '\t') {
-      return null;
-    } else break;
-  }
+  const scanned = scanIndent3(t);
+  if (scanned === null) return null;
+  const [indent, i] = scanned;
   if (i >= t.length) return null;
-  const indent = col;
   let ordered = false;
   let delim = '';
   let start = 0;
@@ -609,7 +613,7 @@ function matchListMarker(t) {
   } else {
     return null;
   }
-  const markerCol = col + (mEnd - i);
+  const markerCol = indent + (mEnd - i);
   // Whitespace after the marker, measured in columns.
   let wCol = markerCol;
   let wEnd = mEnd;
@@ -620,22 +624,22 @@ function matchListMarker(t) {
   }
   const wsWidth = wCol - markerCol;
   if (wEnd >= t.length) {
-    // Empty item (or a blank first line): the content indent is marker + 1.
+    // Empty item (or a blank first line): content indent is marker + 1.
     return {
       ordered, delim, start, indent,
       contentIndent: markerCol + 1,
       content: '', empty: true,
     };
   }
-  if (wsWidth === 0) return null; // the marker must be followed by whitespace
+  if (wsWidth === 0) return null; // a marker needs whitespace after it
   if (wsWidth <= 4) {
     return {
       ordered, delim, start, indent,
       contentIndent: wCol, content: t.slice(wEnd), empty: false,
     };
   }
-  // 5+ columns of whitespace: the content indent is marker + 1, and the
-  // content is the line sliced from there with tabs expanded.
+  // Five or more columns of whitespace: the content indent is marker + 1,
+  // and the content is the line sliced from there with tabs expanded.
   return {
     ordered, delim, start, indent,
     contentIndent: markerCol + 1,
