@@ -1967,6 +1967,10 @@ function parseInline(text, refs, plain) {
   // Positions of backtick runs with no matching closer (an unclosed
   // backtick inside link text blocks the link from forming).
   const unclosedTicks = [];
+  // [start, end] of every closed code span (for the link-text backtick
+  // parity exception: an odd run count is allowed when the link text
+  // ends with a closed code span).
+  const codeSpans = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
   // run, emphasis delimiters are suppressed until the next backtick run.
   let suppressEmUntilTick = false;
@@ -2080,6 +2084,7 @@ function parseInline(text, refs, plain) {
         flushText(i);
         if (plain) pushChunk(esc(content), i);
         else pushChunk('<code>' + escapeText(content) + '</code>', i);
+        codeSpans.push([i, close + runLen]);
         i = close + runLen;
         textStart = i;
         continue;
@@ -2188,14 +2193,33 @@ function parseInline(text, refs, plain) {
         // forms AND the bracket stays active for a later ']'.
         const openCount = brackets.length - 1 - bi;
         const closeCount = closes.length - br.closesAtPush;
-        // Backtick parity: an ODD number of unclosed backtick runs in the
-        // link text blocks the link (the ']' is inside a code span); an
-        // even number does not.
+        // Backtick parity: count ALL unescaped backtick runs in the link
+        // text (including runs inside code spans). An odd count blocks
+        // the link — unless the link text ends with a closed code span
+        // (its closing run immediately before this ']').
         let tickCount = 0;
-        for (const tp of unclosedTicks) {
-          if (tp > br.srcPos && tp < i) tickCount++;
+        for (let tp = br.srcPos + 1; tp < i; tp++) {
+          if (text[tp] === '\\') { tp++; continue; }
+          if (text[tp] === '`') {
+            tickCount++;
+            while (tp + 1 < i && text[tp + 1] === '`') tp++;
+          }
         }
-        if (openCount === closeCount && tickCount % 2 === 0) {
+        let parityOk = tickCount % 2 === 0;
+        if (!parityOk) {
+          const lastCs = codeSpans[codeSpans.length - 1];
+          parityOk = !!lastCs && lastCs[1] === i && lastCs[0] > br.srcPos;
+        }
+        // Marked quirk: a failed inline-link attempt (']' followed by
+        // '(' with no link forming) suppresses emphasis inside the
+        // bracket text. Applies to balance/parity failures too.
+        if ((openCount !== closeCount || !parityOk) &&
+            i + 1 < n && text[i + 1] === '(') {
+          for (const d of delims) {
+            if (d.chunk > br.chunk && d.scope === 0) d.dead = true;
+          }
+        }
+        if (openCount === closeCount && parityOk) {
         const linkTextRaw = text.slice(br.srcPos + 1, i);
         let href = null;
         let title = null;
@@ -2303,7 +2327,13 @@ function parseInline(text, refs, plain) {
           continue;
         }
         // Failure (balanced text, no usable suffix): deactivate this
-        // bracket so a later ']' cannot reuse it.
+        // bracket so a later ']' cannot reuse it. A failed inline-link
+        // attempt suppresses emphasis inside the bracket text.
+        if (i + 1 < n && text[i + 1] === '(') {
+          for (const d of delims) {
+            if (d.chunk > br.chunk && d.scope === 0) d.dead = true;
+          }
+        }
         brackets[bi].active = false;
         // Nested-adjacent-']]' rule (cm-512): if the next char is ']' and
         // the char after that starts a link suffix, and this bracket's
