@@ -1527,6 +1527,10 @@ function matchInlineHtml(text, i) {
 // spans, or link text do not affect the state (a link's text is parsed
 // in an isolated scope that restores the state when the link forms).
 let inLinkGlobal = false;
+// Count of markdown links formed during the current parse() call. Used
+// to detect a link formed inside a strikethrough's recursive parse: a
+// bracket enclosing such a strikethrough can never form a link itself.
+let linksFormed = 0;
 
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
 // separated by single dots, at least two labels. Returns the end index of
@@ -2140,7 +2144,16 @@ function parseInline(text, refs, plain) {
         const closer = findTildeCloser(text, j, runLen);
         if (closer !== -1) {
           flushText(i);
+          const linksBefore = linksFormed;
           const inner = parseInline(text.slice(j, closer), refs, plain);
+          // A link formed inside the strikethrough blocks every
+          // enclosing bracket from forming a link (links cannot
+          // contain links).
+          if (linksFormed > linksBefore) {
+            for (const b of brackets) {
+              if (b.active) b.linkBlocked = true;
+            }
+          }
           if (!plain) pushChunk('<del>', i);
           pushChunk(inner, j);
           if (!plain) pushChunk('</del>', closer);
@@ -2162,6 +2175,7 @@ function parseInline(text, refs, plain) {
       brackets.push({
         chunk: brChunk, bangChunk, srcPos: i + 1, isImage: true, active: true,
         closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
+        linkBlocked: false,
       });
       i += 2;
       textStart = i;
@@ -2175,6 +2189,7 @@ function parseInline(text, refs, plain) {
       brackets.push({
         chunk: brChunk, bangChunk: -1, srcPos: i, isImage: false, active: true,
         closesAtPush: closes.length, inLinkAtPush: inLinkGlobal,
+        linkBlocked: false,
       });
       i++;
       textStart = i;
@@ -2210,16 +2225,22 @@ function parseInline(text, refs, plain) {
           const lastCs = codeSpans[codeSpans.length - 1];
           parityOk = !!lastCs && lastCs[1] === i && lastCs[0] > br.srcPos;
         }
+        // A bracket containing a markdown link (formed inside a
+        // strikethrough's recursive parse) can never form a link
+        // itself: links cannot contain links.
+        const linkBlocked = br.linkBlocked;
+        if (linkBlocked) brackets[bi].active = false;
         // Marked quirk: a failed inline-link attempt (']' followed by
         // '(' with no link forming) suppresses emphasis inside the
-        // bracket text. Applies to balance/parity failures too.
-        if ((openCount !== closeCount || !parityOk) &&
+        // bracket text. Applies to balance/parity/link-blocked
+        // failures too.
+        if ((linkBlocked || openCount !== closeCount || !parityOk) &&
             i + 1 < n && text[i + 1] === '(') {
           for (const d of delims) {
             if (d.chunk > br.chunk && d.scope === 0) d.dead = true;
           }
         }
-        if (openCount === closeCount && parityOk) {
+        if (!linkBlocked && openCount === closeCount && parityOk) {
         const linkTextRaw = text.slice(br.srcPos + 1, i);
         let href = null;
         let title = null;
@@ -2264,6 +2285,7 @@ function parseInline(text, refs, plain) {
           flushText(i);
           const L = chunks.length;
           if (!br.isImage) {
+            linksFormed++;
             scopeCounter++;
             for (const d of delims) {
               if (!d.dead && d.chunk > br.chunk && d.chunk < L) {
@@ -2699,6 +2721,7 @@ function renderBlocks(blocks, refs, out) {
 
 export function parse(markdown) {
   inLinkGlobal = false;
+  linksFormed = 0;
   const lines = splitLines(markdown);
   const refs = new Map();
   const blocks = parseBlocks(lines, refs);
