@@ -1868,8 +1868,17 @@ function parseBlocks(lines, refs, inListItem) {
 // Skip tag whitespace (space, tab, newline) from j; return the new index.
 function skipTagWs(text, j) {
   const n = text.length;
-  while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
+  while (j < n) {
+    const c = text[j];
+    if (c !== ' ' && c !== '\t' && c !== '\n') break;
+    j++;
+  }
   return j;
+}
+
+// Is c a valid character in an HTML attribute name (after the first)?
+function isTagAttrChar(c) {
+  return isAlpha(c) || isDigit(c) || c === '_' || c === '.' || c === ':' || c === '-';
 }
 
 // Scan one attribute starting at text[j] (first char of the name).
@@ -1877,39 +1886,45 @@ function skipTagWs(text, j) {
 // boolean attribute), or -1 when the attribute is malformed.
 function scanTagAttribute(text, j) {
   const n = text.length;
-  if (!isAlpha(text[j]) && text[j] !== '_' && text[j] !== ':') return -1;
+  const first = text[j];
+  if (!isAlpha(first) && first !== '_' && first !== ':') return -1;
   j++;
-  while (j < n) {
-    const c = text[j];
-    if (isAlpha(c) || isDigit(c) || c === '_' || c === '.' || c === ':' || c === '-') j++;
-    else break;
-  }
+  while (j < n && isTagAttrChar(text[j])) j++;
   const afterName = j;
   j = skipTagWs(text, j);
-  if (j < n && text[j] === '=') {
-    j++;
-    j = skipTagWs(text, j);
-    if (j >= n) return -1;
-    const q = text[j];
-    if (q === '"' || q === "'") {
-      j++;
-      while (j < n && text[j] !== q) j++;
-      if (j >= n) return -1;
-      return j + 1;
-    }
-    const vs = j;
-    while (j < n) {
-      const c = text[j];
-      if (c === ' ' || c === '\t' || c === '\n' || c === '>' || c === '"' ||
-          c === "'" || c === '=' || c === '<' || c === '`') break;
-      j++;
-    }
-    if (j === vs) return -1;
-    return j;
+  if (j >= n || text[j] !== '=') {
+    // Boolean attribute (no '='): the whitespace after the name stays for
+    // the next iteration's separator check.
+    return afterName;
   }
-  // Boolean attribute (no '='): the whitespace after the name stays for
-  // the next iteration's separator check.
-  return afterName;
+  j++;
+  j = skipTagWs(text, j);
+  if (j >= n) return -1;
+  const q = text[j];
+  if (q === '"' || q === "'") {
+    j++;
+    while (j < n && text[j] !== q) j++;
+    if (j >= n) return -1;
+    return j + 1;
+  }
+  const vs = j;
+  while (j < n) {
+    const c = text[j];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '>' || c === '"' ||
+        c === "'" || c === '=' || c === '<' || c === '`') break;
+    j++;
+  }
+  if (j === vs) return -1;
+  return j;
+}
+
+// Scan a tag name starting at text[j] (first letter). Returns the index
+// just past the name.
+function scanTagName(text, j) {
+  const n = text.length;
+  let k = j + 1;
+  while (k < n && (isAlpha(text[k]) || isDigit(text[k]) || text[k] === '-')) k++;
+  return k;
 }
 
 // Match an inline HTML tag starting at text[i] ('<'). Returns the index just
@@ -1924,8 +1939,7 @@ function matchInlineTag(text, i) {
     j++;
   }
   if (j >= n || !isAlpha(text[j])) return -1;
-  j++;
-  while (j < n && (isAlpha(text[j]) || isDigit(text[j]) || text[j] === '-')) j++;
+  j = scanTagName(text, j);
   for (;;) {
     const wsEnd = skipTagWs(text, j);
     const hadWs = wsEnd > j;
@@ -1942,7 +1956,21 @@ function matchInlineTag(text, i) {
 // Find `needle` in text from `from`; return the index just past it, or -1.
 function findTerminator(text, needle, from) {
   const e = text.indexOf(needle, from);
-  return e === -1 ? -1 : e + needle.length;
+  if (e === -1) return -1;
+  return e + needle.length;
+}
+
+// Match a declaration <!NAME ...> starting at text[i]. Returns the index
+// just past '>', or -1. NAME is one or more letters, followed by
+// whitespace (or newline) before the rest.
+function matchDeclaration(text, i) {
+  const n = text.length;
+  let j = i + 2;
+  const ls = j;
+  while (j < n && isAlpha(text[j])) j++;
+  if (j === ls) return -1;
+  if (j >= n || (!isSpaceOrTab(text[j]) && text[j] !== '\n')) return -1;
+  return findTerminator(text, '>', j);
 }
 
 // Match inline raw HTML starting at text[i] ('<'): comment, PI, declaration,
@@ -1961,13 +1989,7 @@ function matchInlineHtml(text, i) {
     return findTerminator(text, ']]>', i + 9);
   }
   if (i + 2 < n && text[i + 1] === '!') {
-    // Declaration: <! + letters + whitespace + ... + '>'.
-    let j = i + 2;
-    const ls = j;
-    while (j < n && isAlpha(text[j])) j++;
-    if (j === ls) return -1;
-    if (j >= n || (!isSpaceOrTab(text[j]) && text[j] !== '\n')) return -1;
-    return findTerminator(text, '>', j);
+    return matchDeclaration(text, i);
   }
   return matchInlineTag(text, i);
 }
@@ -1994,6 +2016,11 @@ let linksFormed = 0;
 // so only creation-time tracking can distinguish them).
 let extAutolinks = [];
 
+// Is c a valid character in an email local part ([A-Za-z0-9._+-])?
+function isEmailLocalChar(c) {
+  return isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-';
+}
+
 // Scan an email local part (the part before '@') starting at s:
 // [A-Za-z0-9._+-]+. Returns the end index.
 function scanEmailLocal(text, s) {
@@ -2001,10 +2028,31 @@ function scanEmailLocal(text, s) {
   let j = s;
   while (j < n) {
     const c = text[j];
-    if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
-    else break;
+    if (!isEmailLocalChar(c)) break;
+    j++;
   }
   return j;
+}
+
+// Is c a valid character in an email domain ([A-Za-z0-9_.-])?
+function isEmailDomainChar(c) {
+  return isAlpha(c) || isDigit(c) || c === '_' || c === '-' || c === '.';
+}
+
+// Trim trailing dots (and, when trimUnderscore is set, trailing
+// underscores) from the domain text[dStart..end). Trimming '_' can expose
+// more '.'s, so the loop repeats until stable. Returns the new end index.
+function trimDomainEnd(text, dStart, end, trimUnderscore) {
+  for (;;) {
+    while (end > dStart && text[end - 1] === '.') end--;
+    if (!trimUnderscore) return end;
+    let trimmed = false;
+    while (end > dStart && text[end - 1] === '_') {
+      end--;
+      trimmed = true;
+    }
+    if (!trimmed) return end;
+  }
 }
 
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
@@ -2017,24 +2065,8 @@ function scanEmailLocal(text, s) {
 function matchEmailDomain(text, dStart, trimTrailingUnderscore) {
   const n = text.length;
   let j = dStart;
-  while (j < n) {
-    const c = text[j];
-    if (isAlpha(c) || isDigit(c) || c === '_' || c === '-' || c === '.') j++;
-    else break;
-  }
-  let end = j;
-  // Trim trailing dots, and (when trimTrailingUnderscore is set) trailing
-  // underscores; repeat, because trimming '_' can expose more '.'s.
-  for (;;) {
-    while (end > dStart && text[end - 1] === '.') end--;
-    if (!trimTrailingUnderscore) break;
-    let trimmed = false;
-    while (end > dStart && text[end - 1] === '_') {
-      end--;
-      trimmed = true;
-    }
-    if (!trimmed) break;
-  }
+  while (j < n && isEmailDomainChar(text[j])) j++;
+  const end = trimDomainEnd(text, dStart, j, trimTrailingUnderscore);
   if (end === dStart) return -1;
   const last = text[end - 1];
   if (last === '_' || last === '-') return -1;
@@ -2053,16 +2085,25 @@ function matchEmail(text, atPos, minStart, trimTrailingUnderscore) {
   // start): a '_' emphasis delimiter before it is not part of the email.
   const lo = minStart === undefined ? 0 : minStart;
   let s = atPos - 1;
-  while (s >= lo) {
-    const c = text[s];
-    if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') s--;
-    else break;
-  }
+  while (s >= lo && isEmailLocalChar(text[s])) s--;
   const start = s + 1;
   if (start === atPos) return null;
   const end = matchEmailDomain(text, atPos + 1, trimTrailingUnderscore);
   if (end === -1) return null;
   return { start, end };
+}
+
+// Scan a scheme starting at text[j] (a letter): [A-Za-z0-9+.-]*. Returns
+// the index just past the scheme.
+function scanScheme(text, j) {
+  const n = text.length;
+  let k = j + 1;
+  while (k < n) {
+    const c = text[k];
+    if (isAlpha(c) || isDigit(c) || c === '+' || c === '.' || c === '-') k++;
+    else break;
+  }
+  return k;
 }
 
 // Match an angle autolink <...> starting at text[i]. Returns
@@ -2072,12 +2113,7 @@ function matchAngleAutolink(text, i) {
   // Scheme: letter, then [A-Za-z0-9+.-]*, length 2-32, then ':'.
   let j = i + 1;
   if (j < n && isAlpha(text[j])) {
-    let k = j + 1;
-    while (k < n) {
-      const c = text[k];
-      if (isAlpha(c) || isDigit(c) || c === '+' || c === '.' || c === '-') k++;
-      else break;
-    }
+    const k = scanScheme(text, j);
     const schemeLen = k - j;
     if (schemeLen >= 2 && schemeLen <= 32 && k < n && text[k] === ':') {
       let e = k + 1;
@@ -2103,7 +2139,8 @@ function matchAngleAutolink(text, i) {
 function matchEmailAt(text, s) {
   const n = text.length;
   const j = scanEmailLocal(text, s);
-  if (j === s || j >= n || text[j] !== '@') return null;
+  if (j === s) return null;
+  if (j >= n || text[j] !== '@') return null;
   const end = matchEmailDomain(text, j + 1);
   if (end === -1 || end >= n || text[end] !== '>') return null;
   const email = text.slice(s, end);
@@ -2116,15 +2153,17 @@ function trailingEntityAmp(s) {
   if (!s.endsWith(';')) return -1;
   let k = s.length - 2;
   while (k >= 0 && isWordChar(s[k])) k--;
-  if (k >= 0 && s[k] === '&' && k < s.length - 2) return k;
-  return -1;
+  if (k < 0) return -1;
+  if (s[k] !== '&') return -1;
+  if (k >= s.length - 2) return -1;
+  return k;
 }
 
-// Trim an extended-autolink candidate per marked's rules: paren groups,
-// trailing named entities, trailing punctuation, unmatched trailing ')'.
-function trimUrlCandidate(cand) {
-  // Paren groups: '(' opens a group ending at the next ')' (no nesting).
-  // A '(' with no later ')' cuts the URL there.
+// Find the paren-group structure of a URL candidate: '(' opens a group
+// ending at the next ')' (no nesting). A '(' with no later ')' cuts the
+// URL there. Returns {cut, closers}: cut is the candidate length after
+// the cut, closers the set of ')' indices that close a group.
+function scanParenGroups(cand) {
   const closers = new Set();
   let cut = cand.length;
   let i = 0;
@@ -2139,6 +2178,13 @@ function trimUrlCandidate(cand) {
       i = close + 1;
     } else i++;
   }
+  return { cut, closers };
+}
+
+// Trim an extended-autolink candidate per marked's rules: paren groups,
+// trailing named entities, trailing punctuation, unmatched trailing ')'.
+function trimUrlCandidate(cand) {
+  const { cut, closers } = scanParenGroups(cand);
   let s = cand.slice(0, cut);
   // Trailing trims, looped until stable.
   for (;;) {
@@ -2171,79 +2217,94 @@ const WWW_PRECEDING_OK = new Set([' ', '\t', '\n', '(', '*', '_', '~']);
 function scanSchemeEmail(text, s, trimTrailingUnderscore) {
   const n = text.length;
   const j = scanEmailLocal(text, s);
-  if (j === s || j >= n || text[j] !== '@') return -1;
+  if (j === s) return -1;
+  if (j >= n || text[j] !== '@') return -1;
   return matchEmailDomain(text, j + 1, trimTrailingUnderscore);
+}
+
+// www. (lowercase only, restricted preceding char, host starts alnum/-).
+function matchWwwAutolink(text, i) {
+  const n = text.length;
+  const prev = i === 0 ? '' : text[i - 1];
+  if (i > 0 && !WWW_PRECEDING_OK.has(prev)) return null;
+  const h = i + 4;
+  if (h >= n) return null;
+  const hc = text[h];
+  if (!isAlpha(hc) && !isDigit(hc) && hc !== '-') return null;
+  const url = scanUrl(text, i);
+  if (!url) return null;
+  return { href: 'http://' + url, text: url, end: i + url.length, extended: true };
+}
+
+// Schemes http/https/ftp (case-insensitive), no preceding restriction.
+function matchHttpAutolink(text, i) {
+  const n = text.length;
+  const low = text.slice(i, i + 8).toLowerCase();
+  let schemeLen = 0;
+  if (low.startsWith('https://')) schemeLen = 8;
+  else if (low.startsWith('http://')) schemeLen = 7;
+  else if (low.startsWith('ftp://')) schemeLen = 6;
+  if (schemeLen === 0) return null;
+  const h = i + schemeLen;
+  if (h >= n) return null;
+  const hc = text[h];
+  if (!isAlpha(hc) && !isDigit(hc) && hc !== '-') return null;
+  const url = scanUrl(text, i);
+  if (!url) return null;
+  return { href: url, text: url, end: i + url.length, extended: true };
+}
+
+// mailto: (lowercase only, preceding char must not be a word char).
+// The email must start right after 'mailto:'.
+function matchMailtoAutolink(text, i, trimTrailingUnderscore) {
+  const prev = i === 0 ? '' : text[i - 1];
+  if (i > 0 && (isAlpha(prev) || isDigit(prev))) return null;
+  const end = scanSchemeEmail(text, i + 7, trimTrailingUnderscore);
+  if (end === -1) return null;
+  const full = 'mailto:' + text.slice(i + 7, end);
+  return { href: full, text: full, end, extended: true };
+}
+
+// xmpp: (lowercase only, preceding char must not be a word char).
+// Email right after, plus an optional path: '/' + [A-Za-z0-9.@]+
+// with trailing '.'s trimmed. (The only other scheme+email autolink.)
+function matchXmppAutolink(text, i, trimTrailingUnderscore) {
+  const n = text.length;
+  const prev = i === 0 ? '' : text[i - 1];
+  if (i > 0 && (isAlpha(prev) || isDigit(prev))) return null;
+  const end = scanSchemeEmail(text, i + 5, trimTrailingUnderscore);
+  if (end === -1) return null;
+  let linkEnd = end;
+  if (end < n && text[end] === '/') {
+    let p = end + 1;
+    while (p < n) {
+      const c = text[p];
+      if (isAlpha(c) || isDigit(c) || c === '.' || c === '@') p++;
+      else break;
+    }
+    let pe = p;
+    while (pe > end + 1 && text[pe - 1] === '.') pe--;
+    if (pe > end + 1) linkEnd = pe;
+  }
+  const full = text.slice(i, linkEnd);
+  return { href: full, text: full, end: linkEnd, extended: true };
 }
 
 // Match an extended autolink starting at text[i]. Returns
 // {href, text, end, extended} or null. Handles www., http(s)://, ftp://,
 // mailto:, and bare emails (via '@').
 function matchExtendedUrl(text, i, trimTrailingUnderscore) {
-  const n = text.length;
-  // www. (lowercase only, restricted preceding char, host starts alnum/-).
-  if (text.startsWith('www.', i)) {
-    const prev = i === 0 ? '' : text[i - 1];
-    if (i === 0 || WWW_PRECEDING_OK.has(prev)) {
-      const h = i + 4;
-      if (h < n && (isAlpha(text[h]) || isDigit(text[h]) || text[h] === '-')) {
-        const url = scanUrl(text, i);
-        if (url) return { href: 'http://' + url, text: url, end: i + url.length, extended: true };
-      }
-    }
-    return null;
-  }
-  // Schemes http/https/ftp (case-insensitive), no preceding restriction.
+  if (text.startsWith('www.', i)) return matchWwwAutolink(text, i);
   const low = text.slice(i, i + 8).toLowerCase();
-  let schemeLen = 0;
-  if (low.startsWith('https://')) schemeLen = 8;
-  else if (low.startsWith('http://')) schemeLen = 7;
-  else if (low.startsWith('ftp://')) schemeLen = 6;
-  if (schemeLen > 0) {
-    const h = i + schemeLen;
-    if (h < n && (isAlpha(text[h]) || isDigit(text[h]) || text[h] === '-')) {
-      const url = scanUrl(text, i);
-      if (url) return { href: url, text: url, end: i + url.length, extended: true };
-    }
-    return null;
+  if (low.startsWith('https://') || low.startsWith('http://') ||
+      low.startsWith('ftp://')) {
+    return matchHttpAutolink(text, i);
   }
-  // mailto: (lowercase only, preceding char must not be a word char).
   if (text.startsWith('mailto:', i)) {
-    const prev = i === 0 ? '' : text[i - 1];
-    if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
-      // The email must start right after 'mailto:'.
-      const end = scanSchemeEmail(text, i + 7, trimTrailingUnderscore);
-      if (end !== -1) {
-        const full = 'mailto:' + text.slice(i + 7, end);
-        return { href: full, text: full, end, extended: true };
-      }
-    }
-    return null;
+    return matchMailtoAutolink(text, i, trimTrailingUnderscore);
   }
-  // xmpp: (lowercase only, preceding char must not be a word char).
-  // Email right after, plus an optional path: '/' + [A-Za-z0-9.@]+
-  // with trailing '.'s trimmed. (The only other scheme+email autolink.)
   if (text.startsWith('xmpp:', i)) {
-    const prev = i === 0 ? '' : text[i - 1];
-    if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
-      const end = scanSchemeEmail(text, i + 5, trimTrailingUnderscore);
-      if (end !== -1) {
-        let linkEnd = end;
-        if (end < n && text[end] === '/') {
-          let p = end + 1;
-          while (p < n) {
-            const c = text[p];
-            if (isAlpha(c) || isDigit(c) || c === '.' || c === '@') p++;
-            else break;
-          }
-          let pe = p;
-          while (pe > end + 1 && text[pe - 1] === '.') pe--;
-          if (pe > end + 1) linkEnd = pe;
-        }
-        const full = text.slice(i, linkEnd);
-        return { href: full, text: full, end: linkEnd, extended: true };
-      }
-    }
-    return null;
+    return matchXmppAutolink(text, i, trimTrailingUnderscore);
   }
   return null;
 }
@@ -2258,7 +2319,8 @@ function scanUrl(text, i) {
     j++;
   }
   const trimmed = trimUrlCandidate(text.slice(i, j));
-  return trimmed === '' ? null : trimmed;
+  if (trimmed === '') return null;
+  return trimmed;
 }
 
 // ---------------------------------------------------------------------------
@@ -2269,41 +2331,38 @@ function scanUrl(text, i) {
 // Returns {href, title, end} or null.
 function parseInlineLink(text, i) {
   const n = text.length;
-  let j = i + 1;
-  while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
+  let j = skipTagWs(text, i + 1);
   if (j >= n) return null;
   const d = scanLinkDest(text, j, true);
   if (!d) return null;
   const dest = d.dest;
-  j = d.end;
-  while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
+  j = skipTagWs(text, d.end);
   if (j >= n) return null;
   if (text[j] === ')') return { href: dest, title: null, end: j + 1 };
-  if (text[j] === '"' || text[j] === "'" || text[j] === '(') {
-    const tr = parseTitle(text, j, true);
-    if (!tr) return null;
-    j = tr.end;
-    while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
-    if (j >= n || text[j] !== ')') return null;
-    return { href: dest, title: tr.title, end: j + 1 };
-  }
-  return null;
+  if (!isTitleOpener(text[j])) return null;
+  const tr = parseTitle(text, j, true);
+  if (!tr) return null;
+  j = skipTagWs(text, tr.end);
+  if (j >= n || text[j] !== ')') return null;
+  return { href: dest, title: tr.title, end: j + 1 };
 }
 
 // Parse a reference label starting at text[i] ('[').
 // Returns {label, end} or null.
 function parseRefLabel(text, i) {
-  return scanDefLabel(text, i + 1);
+  const scanned = scanDefLabel(text, i + 1);
+  return scanned;
 }
 
 // Are the brackets in text[start..end) balanced (equal '[' and ']' counts,
 // ignoring backslash-escaped brackets)? Link/image text must be balanced.
 function bracketsBalanced(text, start, end) {
   let depth = 0;
-  for (let k = start; k < end; k++) {
+  let k = start;
+  while (k < end) {
     const c = text[k];
     if (c === '\\' && k + 1 < end && isAsciiPunct(text[k + 1])) {
-      k++;
+      k += 2;
       continue;
     }
     if (c === '[') depth++;
@@ -2311,6 +2370,7 @@ function bracketsBalanced(text, start, end) {
       depth--;
       if (depth < 0) return false;
     }
+    k++;
   }
   return depth === 0;
 }
@@ -2330,9 +2390,9 @@ function flanking(text, start, end) {
   const afterWs = isUnicodeWs(after);
   const beforePunct = isPunct(before);
   const afterPunct = isPunct(after);
-  const left = !afterWs && (!afterPunct || beforeWs || beforePunct);
-  const right = !beforeWs && (!beforePunct || afterWs || afterPunct);
-  return { left, right, beforePunct, afterPunct };
+  const canOpen = !afterWs && (!afterPunct || beforeWs || beforePunct);
+  const canClose = !beforeWs && (!beforePunct || afterWs || afterPunct);
+  return { left: canOpen, right: canClose, beforePunct, afterPunct };
 }
 
 // Is the '_' run starting at `start` part of a valid email's local part?
@@ -2342,7 +2402,16 @@ function underscoreInEmail(text, start) {
   const j = scanEmailLocal(text, start);
   if (j >= n || text[j] !== '@') return false;
   const em = matchEmail(text, j);
-  return em !== null && em.start <= start;
+  if (em === null) return false;
+  return em.start <= start;
+}
+
+// Length of the '~' run starting at text[i].
+function tildeRunLength(text, i) {
+  const n = text.length;
+  let j = i;
+  while (j < n && text[j] === '~') j++;
+  return j - i;
 }
 
 // Find the closing '~' run for an opener of length len, searching from `from`.
@@ -2364,9 +2433,9 @@ function findTildeCloser(text, from, len) {
       i++;
       continue;
     }
-    let j = i;
-    while (j < n && text[j] === '~') j++;
-    if (j - i === len) {
+    const runLen = tildeRunLength(text, i);
+    const j = i + runLen;
+    if (runLen === len) {
       // Strikethrough uses the same flanking rules as emphasis: a run
       // preceded by punctuation (e.g. an escaped '~') and followed by a
       // letter can only open, not close.
