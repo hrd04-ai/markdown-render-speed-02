@@ -2964,6 +2964,14 @@ function parseInline(text, refs, plain) {
 // Rendering
 // ---------------------------------------------------------------------------
 
+// The task-list checkbox HTML for a list item, or '' when this is not a
+// task item or not the first child.
+function taskCheckbox(item, isFirst) {
+  if (!isFirst || !item.task) return '';
+  const checked = item.task === 'checked' ? 'checked="" ' : '';
+  return `<input ${checked}disabled="" type="checkbox"> `;
+}
+
 function renderItem(item, loose, refs, out) {
   out.push('<li>');
   const children = item.children;
@@ -2973,20 +2981,45 @@ function renderItem(item, loose, refs, out) {
   }
   for (let ci = 0; ci < children.length; ci++) {
     const ch = children[ci];
-    if (ch.t === 'p') {
-      const checkbox = ci === 0 && item.task
-        ? `<input ${item.task === 'checked' ? 'checked="" ' : ''}disabled="" type="checkbox"> `
-        : '';
-      if (loose) {
-        out.push('<p>', checkbox, parseInline(ch.text, refs, false), '</p>\n');
-      } else {
-        out.push(checkbox, parseInline(ch.text, refs, false));
-      }
-    } else {
+    if (ch.t !== 'p') {
       renderBlocks([ch], refs, out);
+      continue;
     }
+    const inner = taskCheckbox(item, ci === 0) + parseInline(ch.text, refs, false);
+    if (loose) out.push('<p>', inner, '</p>\n');
+    else out.push(inner);
   }
   out.push('</li>\n');
+}
+
+function renderTable(b, refs, out) {
+  out.push('<table>\n<thead>\n<tr>\n');
+  for (let ci = 0; ci < b.head.length; ci++) {
+    const al = b.align[ci];
+    out.push(
+      `<th${al ? ` align="${al}"` : ''}>`,
+      parseInline(b.head[ci], refs, false),
+      '</th>\n',
+    );
+  }
+  out.push('</tr>\n</thead>\n');
+  if (b.body.length > 0) {
+    out.push('<tbody>');
+    for (const row of b.body) {
+      out.push('<tr>\n');
+      for (let ci = 0; ci < row.length; ci++) {
+        const al = b.align[ci];
+        out.push(
+          `<td${al ? ` align="${al}"` : ''}>`,
+          parseInline(row[ci], refs, false),
+          '</td>\n',
+        );
+      }
+      out.push('</tr>\n');
+    }
+    out.push('</tbody>');
+  }
+  out.push('</table>\n');
 }
 
 function renderBlocks(blocks, refs, out) {
@@ -3027,36 +3060,9 @@ function renderBlocks(blocks, refs, out) {
         out.push(`</${tag}>\n`);
         break;
       }
-      case 'table': {
-        out.push('<table>\n<thead>\n<tr>\n');
-        for (let ci = 0; ci < b.head.length; ci++) {
-          const al = b.align[ci];
-          out.push(
-            `<th${al ? ` align="${al}"` : ''}>`,
-            parseInline(b.head[ci], refs, false),
-            '</th>\n',
-          );
-        }
-        out.push('</tr>\n</thead>\n');
-        if (b.body.length > 0) {
-          out.push('<tbody>');
-          for (const row of b.body) {
-            out.push('<tr>\n');
-            for (let ci = 0; ci < row.length; ci++) {
-              const al = b.align[ci];
-              out.push(
-                `<td${al ? ` align="${al}"` : ''}>`,
-                parseInline(row[ci], refs, false),
-                '</td>\n',
-              );
-            }
-            out.push('</tr>\n');
-          }
-          out.push('</tbody>');
-        }
-        out.push('</table>\n');
+      case 'table':
+        renderTable(b, refs, out);
         break;
-      }
     }
   }
 }
@@ -3065,6 +3071,9 @@ function renderBlocks(blocks, refs, out) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+// Parse markdown to HTML, matching marked 18.1.3's default output. The
+// module-level inline state (in-link flag, link/autolink tracking) is
+// reset on every call so parses are independent.
 export function parse(markdown) {
   inLinkGlobal = false;
   linksFormed = 0;
