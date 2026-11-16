@@ -2067,7 +2067,31 @@ function parseInline(text, refs, plain) {
                 while (p < k && text[p] === '`') p++;
               } else p++;
             }
-            if (ticks % 2 === 0) break;
+            // The code span stops at this ']' only when a link will
+            // actually form from it: even parity, balanced brackets,
+            // and a resolving suffix (inline, reference, or shortcut).
+            // Otherwise the code span crosses the ']' (e.g. an
+            // undefined reference leaves the bracket literal).
+            const openCount = brackets.length - 1 - bi;
+            const closeCount = closes.length - brackets[bi].closesAtPush;
+            if (ticks % 2 === 0 && openCount === closeCount) {
+              const after = text[k + 1];
+              const label = text.slice(brackets[bi].srcPos + 1, k);
+              let linkForms = false;
+              if (after === '(') {
+                linkForms = parseInlineLink(text, k + 1) !== null ||
+                  refs.has(normalizeLabel(label));
+              } else if (after === '[') {
+                const rl = parseRefLabel(text, k + 1);
+                if (rl) {
+                  linkForms = refs.has(normalizeLabel(
+                    rl.label === '' ? label : rl.label));
+                }
+              } else {
+                linkForms = refs.has(normalizeLabel(label));
+              }
+              if (linkForms) break;
+            }
           }
           k++;
           continue;
@@ -2145,6 +2169,36 @@ function parseInline(text, refs, plain) {
       if ((runLen === 1 || runLen === 2) && flanking(text, i, j).left) {
         const closer = findTildeCloser(text, j, runLen);
         if (closer !== -1) {
+          // A backtick run inside the del content whose first
+          // same-length closer lies AFTER the del closer means the
+          // code span crosses the '~~' — the del does not form.
+          // An escaped backtick (\`) cannot open a code span, so
+          // backslash escapes are skipped when scanning the content.
+          let crosses = false;
+          let p = j;
+          while (p < closer && !crosses) {
+            if (text[p] === '\\' && p + 1 < closer) { p += 2; continue; }
+            if (text[p] === '`') {
+              let e = p;
+              while (e < closer && text[e] === '`') e++;
+              const rLen = e - p;
+              let k = e;
+              while (k < n) {
+                if (text[k] === '`') {
+                  let f = k;
+                  while (f < n && text[f] === '`') f++;
+                  if (f - k === rLen) {
+                    if (k >= closer) crosses = true;
+                    else p = f;
+                    break;
+                  }
+                  k = f;
+                } else k++;
+              }
+              if (k >= n) p = e;
+            } else p++;
+          }
+          if (crosses) { i = j; continue; }
           flushText(i);
           const linksBefore = linksFormed;
           const inner = parseInline(text.slice(j, closer), refs, plain);
