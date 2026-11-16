@@ -996,6 +996,17 @@ function consumeParagraph(lines, i, refs, inListItem) {
     const sx = L.noSetext ? 0 : matchSetext(t);
     if (sx) { endKind = 'setext'; setextLevel = sx; break; }
     if (interruptsParagraph(t, inListItem)) { endKind = 'interrupt'; break; }
+    // Marked quirk: inside a list item, a paragraph continuation line
+    // with 4+ columns of leading whitespace loses 4 columns (top-level
+    // paragraphs keep their leading whitespace as-is).
+    if (inListItem) {
+      const [w] = leadingWs(t);
+      if (w >= 4) {
+        paraLines.push(stripIndent(t, 4));
+        j++;
+        continue;
+      }
+    }
     paraLines.push(t);
     j++;
   }
