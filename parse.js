@@ -1061,6 +1061,13 @@ function parseLinkDef(text) {
 // Paragraphs, setext headings, tables
 // ---------------------------------------------------------------------------
 
+// Does this list marker interrupt the current context? An unordered marker
+// always does; an ordered one only when it starts at 1 — unless we are
+// inside a list item, where any ordered marker interrupts.
+function listMarkerInterrupts(lm, inListItem) {
+  return !lm.ordered || lm.start === 1 || inListItem;
+}
+
 // Can this line start a block that interrupts a paragraph?
 function interruptsParagraph(t, inListItem) {
   if (matchFence(t) || matchATX(t) || matchHR(t)) return true;
@@ -1069,9 +1076,7 @@ function interruptsParagraph(t, inListItem) {
   if (hm && hm.type <= 6) return true;
   const lm = matchListMarker(t);
   // An empty list item (marker with no content) cannot interrupt a paragraph.
-  // Inside a list item's content, ANY list interrupts (no start-with-1
-  // restriction); elsewhere an ordered list must start with 1.
-  if (lm && !lm.empty && (!lm.ordered || lm.start === 1 || inListItem)) return true;
+  if (lm && !lm.empty && listMarkerInterrupts(lm, inListItem)) return true;
   return false;
 }
 
@@ -1083,10 +1088,43 @@ function isTableBodyRow(t) {
   if (matchATX(t) || matchFence(t) || matchHR(t)) return false;
   if (matchHtmlBlock(t)) return false;
   const lm = matchListMarker(t);
-  if (lm && (!lm.ordered || lm.start === 1)) return false;
+  if (lm && listMarkerInterrupts(lm, false)) return false;
   const [w] = leadingWs(t);
   if (w >= 4) return false;
   return true;
+}
+
+// Extract leading link reference definitions from paragraph text,
+// recording them in refs (first definition wins). Returns the text
+// that remains after the definitions.
+function extractLinkDefs(text, refs) {
+  for (;;) {
+    const d = parseLinkDef(text);
+    if (!d) break;
+    if (!refs.has(d.label)) refs.set(d.label, { href: d.href, title: d.title });
+    text = text.slice(d.consumed);
+  }
+  return text;
+}
+
+// Collect table body rows starting at lines[k]. Returns {body, next}.
+function collectTableBody(lines, k, header) {
+  const body = [];
+  while (k < lines.length) {
+    const L = lines[k];
+    // Marked quirk: a terminated line of 0-3 spaces + a single tab is a
+    // body row (empty cells), not a blank line ending the table.
+    const tabRow = L.nl && /^ {0,3}\t$/.test(L.t);
+    if (!tabRow) {
+      if (isBlankLine(L)) break;
+      if (!isTableBodyRow(L.t)) break;
+    }
+    const cells = splitTableRow(L.t);
+    while (cells.length < header.length) cells.push('');
+    body.push(cells.slice(0, header.length));
+    k++;
+  }
+  return { body, next: k };
 }
 
 // Consume a paragraph starting at lines[i]. Handles setext headings, table
@@ -1103,17 +1141,36 @@ function consumeParagraph(lines, i, refs, inListItem) {
   while (j < lines.length) {
     const L = lines[j];
     const t = L.t;
-    if (isBlankLine(L)) { endKind = 'blank'; break; }
+    if (isBlankLine(L)) {
+      endKind = 'blank';
+      break;
+    }
     // Lazy lines never interrupt a paragraph or form setext/table.
-    if (L.lazy) { paraLines.push(t); prevStripped = false; j++; continue; }
+    if (L.lazy) {
+      paraLines.push(t);
+      prevStripped = false;
+      j++;
+      continue;
+    }
     const headerCells = splitTableRow(paraLines[paraLines.length - 1]);
     // A lazy delimiter line in a blockquote never forms a table, and a
     // lazy setext-like line never becomes a setext underline.
     const aligns = L.noTable ? null : matchTableDelimiter(t, headerCells.length);
-    if (aligns) { endKind = 'table'; tableAlign = aligns; break; }
+    if (aligns) {
+      endKind = 'table';
+      tableAlign = aligns;
+      break;
+    }
     const sx = L.noSetext ? 0 : matchSetext(t);
-    if (sx) { endKind = 'setext'; setextLevel = sx; break; }
-    if (interruptsParagraph(t, inListItem)) { endKind = 'interrupt'; break; }
+    if (sx) {
+      endKind = 'setext';
+      setextLevel = sx;
+      break;
+    }
+    if (interruptsParagraph(t, inListItem)) {
+      endKind = 'interrupt';
+      break;
+    }
     // Marked quirk: inside a list item, a paragraph continuation line
     // with 4+ columns of leading whitespace loses 4 columns (top-level
     // paragraphs keep their leading whitespace as-is). A non-stripped
@@ -1133,14 +1190,7 @@ function consumeParagraph(lines, i, refs, inListItem) {
     paraLines.push(t);
     j++;
   }
-  // Extract leading link reference definitions.
-  let text = paraLines.join('\n');
-  for (;;) {
-    const d = parseLinkDef(text);
-    if (!d) break;
-    if (!refs.has(d.label)) refs.set(d.label, { href: d.href, title: d.title });
-    text = text.slice(d.consumed);
-  }
+  const text = extractLinkDefs(paraLines.join('\n'), refs);
   const blocks = [];
   if (text === '') {
     // Only definitions: no paragraph. A setext/table line after definitions
@@ -1160,24 +1210,9 @@ function consumeParagraph(lines, i, refs, inListItem) {
     if (restLines.length > 1) {
       blocks.push({ t: 'p', text: restLines.slice(0, -1).join('\n') });
     }
-    const body = [];
-    let k = j + 1;
-    while (k < lines.length) {
-      const L = lines[k];
-      // Marked quirk: a terminated line of 0-3 spaces + a single tab is a
-      // body row (empty cells), not a blank line ending the table.
-      const tabRow = L.nl && /^ {0,3}\t$/.test(L.t);
-      if (!tabRow) {
-        if (isBlankLine(L)) break;
-        if (!isTableBodyRow(L.t)) break;
-      }
-      const cells = splitTableRow(L.t);
-      while (cells.length < header.length) cells.push('');
-      body.push(cells.slice(0, header.length));
-      k++;
-    }
-    blocks.push({ t: 'table', align: tableAlign, head: header, body });
-    return { blocks, next: k };
+    const tb = collectTableBody(lines, j + 1, header);
+    blocks.push({ t: 'table', align: tableAlign, head: header, body: tb.body });
+    return { blocks, next: tb.next };
   }
   blocks.push({ t: 'p', text });
   return { blocks, next: j };
@@ -1192,11 +1227,9 @@ function consumeParagraph(lines, i, refs, inListItem) {
 // lines and '=' setext lines ARE lazy-able; '-' setext lines are caught by
 // the hr/list checks ('--' alone is lazy-able).
 function isLazyAble(t) {
-  if (matchATX(t) || matchFence(t) || matchHR(t)) return false;
-  if (matchBlockquote(t) !== null) return false;
-  if (matchHtmlBlock(t)) return false;
-  if (matchListMarker(t)) return false;
-  return true;
+  return !matchATX(t) && !matchFence(t) && !matchHR(t) &&
+    matchBlockquote(t) === null && !matchHtmlBlock(t) &&
+    !matchListMarker(t);
 }
 
 // Blockquote lazy-line stripping: strip 4 columns when the leading
@@ -1207,22 +1240,26 @@ function lazyStripQuote(t) {
   return sliceFromCol(t, 4, false);
 }
 
+// The last leaf block under b (b itself unless it is a quote or list).
+function lastLeafOf(b) {
+  if (b.t === 'quote') {
+    if (b.children.length === 0) return null;
+    return lastLeafOf(b.children[b.children.length - 1]);
+  }
+  if (b.t === 'list') {
+    if (b.items.length === 0) return null;
+    const it = b.items[b.items.length - 1];
+    if (it.children.length === 0) return null;
+    return lastLeafOf(it.children[it.children.length - 1]);
+  }
+  return b;
+}
+
 // Find the last leaf block in a parsed block list (descending into the last
 // child of quotes and lists).
 function lastLeaf(blocks) {
   if (blocks.length === 0) return null;
-  let b = blocks[blocks.length - 1];
-  for (;;) {
-    if (b.t === 'quote') {
-      if (b.children.length === 0) return null;
-      b = b.children[b.children.length - 1];
-    } else if (b.t === 'list') {
-      if (b.items.length === 0) return null;
-      const it = b.items[b.items.length - 1];
-      if (it.children.length === 0) return null;
-      b = it.children[it.children.length - 1];
-    } else return b;
-  }
+  return lastLeafOf(blocks[blocks.length - 1]);
 }
 
 // Does the parsed content end with an open paragraph? lastLineBlank says
