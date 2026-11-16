@@ -586,52 +586,50 @@ function matchListMarker(t) {
 // HTML blocks (7 types)
 // ---------------------------------------------------------------------------
 
-const BLOCK_TAGS = new Set([
-  'address', 'article', 'aside', 'base', 'basefont', 'blockquote', 'body',
-  'caption', 'center', 'col', 'colgroup', 'dd', 'details', 'dialog', 'dir',
-  'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form',
-  'frame', 'frameset', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header',
-  'hr', 'html', 'iframe', 'legend', 'li', 'link', 'main', 'menu', 'menuitem',
-  'meta', 'nav', 'noframes', 'ol', 'optgroup', 'option', 'p', 'param',
-  'search', 'section', 'summary', 'table', 'tbody', 'td', 'tfoot', 'th',
-  'thead', 'title', 'tr', 'track', 'ul',
-]);
+const BLOCK_TAGS = new Set(
+  ('address article aside base basefont blockquote body caption center col ' +
+  'colgroup dd details dialog dir div dl dt fieldset figcaption figure ' +
+  'footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html ' +
+  'iframe legend li link main menu menuitem meta nav noframes ol optgroup ' +
+  'option p param search section summary table tbody td tfoot th thead ' +
+  'title tr track ul').split(' '),
+);
 
 // Match an HTML block start. Returns {type, end} where type is 1-7 and end
 // is the terminator string for types 1-5, or null.
-// Type 1: <pre, <script, <style, <textarea (open tag, ends at matching close)
+// Type 1: <pre, <script, <style, <textarea (open tag; ends at the matching
+//   closing tag)
 // Type 2: <!-- (ends at -->)
 // Type 3: <? (ends at ?>)
 // Type 4: <! + letter (ends at >)
 // Type 5: <![CDATA[ (ends at ]]>)
-// Type 6: block tag open/close alone on the line (ends at blank line)
-// Type 7: any other complete open/close tag alone on the line (ends at blank)
+// Type 6: block tag open/close, alone enough on the line (ends at blank)
+// Type 7: any other complete open/close tag alone on the line (ends at
+//   blank)
 function matchHtmlBlock(t) {
-  let i = 0;
-  while (i < t.length && t[i] === ' ' && i < 3) i++;
-  if (i < t.length && t[i] === '\t') return null;
-  if (i >= t.length || t[i] !== '<') return null;
+  const i = skipUpTo3Spaces(t);
+  if (i === -1 || i >= t.length || t[i] !== '<') return null;
   const rest = t.slice(i);
   // Type 2: comment.
   if (rest.startsWith('<!--')) return { type: 2, end: '-->' };
-  // Type 3: processing instruction (block form accepts <? without ?>).
+  // Type 3: processing instruction (the block form accepts <? without ?>).
   if (rest.startsWith('<?')) return { type: 3, end: '?>' };
-  // Type 5: CDATA (block form accepts lowercase too).
+  // Type 5: CDATA (the block form accepts lowercase too).
   if (/^<!\[CDATA\[/i.test(rest)) return { type: 5, end: ']]>' };
-  // Type 4: <! + letter (block form accepts lowercase too).
+  // Type 4: <! + letter (the block form accepts lowercase too).
   if (rest.length > 2 && rest[1] === '!' && isAlpha(rest[2])) {
     return { type: 4, end: '>' };
   }
-  // Type 1: pre/script/style/textarea open tag (EOL after the name counts:
-  // '<style' alone on a line starts a type-1 block).
+  // Type 1: pre/script/style/textarea open tag. End of line right after
+  // the name counts: '<style' alone on a line starts a type-1 block.
   const m1 = /^<(pre|script|style|textarea)(\s|\/?>|$)/i.exec(rest);
   if (m1) return { type: 1, end: '</' + m1[1].toLowerCase() + '>' };
+  const mName = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
   // Type 6: a block tag name followed by whitespace, end of line, '>', or
   // '/>'. The rest of the line is irrelevant ('<table><tr><td>' and
   // '<div id="foo"' both start type-6 blocks).
-  const m6 = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
-  if (m6 && BLOCK_TAGS.has(m6[1].toLowerCase())) {
-    const a = m6[0].length;
+  if (mName && BLOCK_TAGS.has(mName[1].toLowerCase())) {
+    const a = mName[0].length;
     const after = rest[a];
     if (after === undefined || after === ' ' || after === '\t' ||
         after === '>' || (after === '/' && rest[a + 1] === '>')) {
@@ -644,7 +642,6 @@ function matchHtmlBlock(t) {
   // on closing tags, whitespace required between attributes).
   const tagEnd = matchInlineTag(rest, 0);
   if (tagEnd !== -1) {
-    const mName = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
     let after = i + tagEnd;
     while (after < t.length && isSpaceOrTab(t[after])) after++;
     if (after >= t.length && mName && !BLOCK_TAGS.has(mName[1].toLowerCase())) {
@@ -662,14 +659,24 @@ function stripIndent(t, n, tabAsOne) {
   let i = 0;
   while (i < t.length && col < n) {
     const c = t[i];
-    if (c === ' ') { col++; i++; }
-    else if (c === '\t') {
-      // Fences count each tab as one column (marked quirk); elsewhere a
+    if (c === ' ') {
+      col++;
+      i++;
+    } else if (c === '\t') {
+      // Fences count each tab as one column (a marked quirk); elsewhere a
       // tab expands to its full width and may leave partial spaces.
-      if (tabAsOne) { col++; i++; continue; }
+      if (tabAsOne) {
+        col++;
+        i++;
+        continue;
+      }
       const w = tabWidth(col);
-      if (col + w <= n) { col += w; i++; }
-      else return ' '.repeat(col + w - n) + t.slice(i + 1);
+      if (col + w <= n) {
+        col += w;
+        i++;
+      } else {
+        return ' '.repeat(col + w - n) + t.slice(i + 1);
+      }
     } else break;
   }
   return t.slice(i);
@@ -682,28 +689,31 @@ function stripIndent(t, n, tabAsOne) {
 // Split a table row line into cells: split on unescaped '|', trim spaces/tabs,
 // drop an empty edge cell when the line starts/ends with '|'.
 function splitTableRow(line) {
-  const cells = [];
-  let cur = '';
-  let i = 0;
   const n = line.length;
-  // Trim leading/trailing whitespace for edge detection.
   let s = 0;
   let e = n;
   while (s < n && isSpaceOrTab(line[s])) s++;
   while (e > s && isSpaceOrTab(line[e - 1])) e--;
   const startsPipe = s < e && line[s] === '|';
   const endsPipe = e > s && line[e - 1] === '|';
-  for (i = s; i < e; i++) {
+  const cells = [];
+  let cellStart = s;
+  let i = s;
+  while (i < e) {
     const c = line[i];
     if (c === '\\' && i + 1 < e && line[i + 1] === '|') {
-      cur += '|';
+      i += 2; // escaped pipe: part of the cell, handled by the replace below
+      continue;
+    }
+    if (c === '|') {
+      cells.push(line.slice(cellStart, i).replace(/\\\|/g, '|'));
       i++;
-    } else if (c === '|') {
-      cells.push(cur);
-      cur = '';
-    } else cur += c;
+      cellStart = i;
+      continue;
+    }
+    i++;
   }
-  cells.push(cur);
+  cells.push(line.slice(cellStart, e).replace(/\\\|/g, '|'));
   if (startsPipe) cells.shift();
   if (endsPipe) cells.pop();
   for (let k = 0; k < cells.length; k++) {
@@ -712,22 +722,29 @@ function splitTableRow(line) {
   return cells;
 }
 
+// Split a delimiter-row candidate on '|' and drop empty edge parts.
+function splitDelimiterCells(rest) {
+  const parts = rest.split('|');
+  if (parts.length > 0 && parts[0].trim() === '' && rest.startsWith('|')) {
+    parts.shift();
+  }
+  if (parts.length > 0 && parts[parts.length - 1].trim() === '' &&
+      rest.trimEnd().endsWith('|')) {
+    parts.pop();
+  }
+  return parts;
+}
+
 // Match a table delimiter row. Returns the align array or null.
 // Delimiter cells are :?-+:? separated by '|', optional edge pipes, and the
-// row MUST contain a '|' and have exactly headerCount cells. No tabs allowed
-// anywhere in the row (tabs inside cells, between cells, or trailing kill it).
+// row MUST contain a '|' and have exactly headerCount cells. No tabs
+// anywhere in the row (tabs inside cells, between cells, or trailing
+// kill it).
 function matchTableDelimiter(t, headerCount) {
-  if (t.indexOf('\t') !== -1) return null;
-  if (t.indexOf('|') === -1) return null;
-  let i = 0;
-  while (i < t.length && t[i] === ' ' && i < 3) i++;
-  if (i >= t.length) return null;
-  if (t[i] === '\t') return null;
-  // Split on '|' (no escapes in delimiter rows; a \| would break the cell).
-  const parts = t.slice(i).split('|');
-  // Drop empty edge parts.
-  if (parts.length > 0 && parts[0].trim() === '' && t.slice(i).startsWith('|')) parts.shift();
-  if (parts.length > 0 && parts[parts.length - 1].trim() === '' && t.slice(i).trimEnd().endsWith('|')) parts.pop();
+  if (t.includes('\t') || !t.includes('|')) return null;
+  const i = skipUpTo3Spaces(t);
+  if (i === -1 || i >= t.length) return null;
+  const parts = splitDelimiterCells(t.slice(i));
   if (parts.length !== headerCount) return null;
   const aligns = [];
   for (const p of parts) {
@@ -743,15 +760,10 @@ function matchTableDelimiter(t, headerCount) {
 // Does this line look like a table delimiter row (ignoring cell count)?
 // Used to flag lazy delimiter lines in blockquotes (they never form tables).
 function looksLikeTableDelimiter(t) {
-  if (t.indexOf('\t') !== -1) return false;
-  if (t.indexOf('|') === -1) return false;
-  let i = 0;
-  while (i < t.length && t[i] === ' ' && i < 3) i++;
-  if (i >= t.length) return false;
-  const rest = t.slice(i);
-  const parts = rest.split('|');
-  if (parts.length > 0 && parts[0].trim() === '' && rest.startsWith('|')) parts.shift();
-  if (parts.length > 0 && parts[parts.length - 1].trim() === '' && rest.trimEnd().endsWith('|')) parts.pop();
+  if (t.includes('\t') || !t.includes('|')) return false;
+  const i = skipUpTo3Spaces(t);
+  if (i === -1 || i >= t.length) return false;
+  const parts = splitDelimiterCells(t.slice(i));
   if (parts.length === 0) return false;
   for (const p of parts) {
     if (!/^:?-+:?$/.test(p.trim())) return false;
