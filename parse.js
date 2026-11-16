@@ -2462,20 +2462,21 @@ function parseInline(text, refs, plain) {
   const delims = [];
   const brackets = [];
   const autoLinks = [];
-  // Every ']' position (link-text balance: a link/image only forms when
-  // its text has equal '[' and ']' counts).
+  // Positions of every ']' seen so far. A link or image only forms when
+  // its text has equal '[' and ']' counts, so these positions anchor the
+  // balance check.
   const closes = [];
-  // Backtick runs with no matching closer (an unclosed backtick inside
-  // link text blocks the link from forming).
+  // Backtick runs that never found a matching closer. An unclosed
+  // backtick inside link text blocks the link from forming.
   const unclosedTicks = [];
-  // [start, end] of every closed code span (link-text backtick parity
-  // exception: an odd run count is allowed when the link text ends with
-  // a closed code span).
+  // [start, end] of every closed code span. The link-text backtick
+  // parity exception: an odd run count is allowed when the link text
+  // ends with a closed code span.
   const codeSpans = [];
   // Chunk indices of <del> elements whose content ends with a blocking
-  // strong pair (a ** pair whose opener is preceded by a space and whose
-  // closer is at the end of the del content, optionally followed by
-  // letters). Such a del blocks an enclosing * em match.
+  // strong pair — a ** pair whose opener is preceded by a space and
+  // whose closer sits at the end of the del content, optionally followed
+  // by letters. Such a del blocks an enclosing * em match.
   const blockingDels = [];
   // Chunk indices of <del> elements whose content ends with a * em
   // (closer at the end, optionally followed by letters). Such a del
@@ -2495,14 +2496,15 @@ function parseInline(text, refs, plain) {
   let i = 0;
   let textStart = 0;
 
+  // Append one output chunk, remembering where it came from in the source.
   function pushChunk(s, src) {
     chunks.push(s);
     chunkSrc.push(src);
   }
+  // Flush the plain text run [textStart, upto) as one escaped chunk.
   function flushText(upto) {
-    if (upto > textStart) {
-      pushChunk(esc(text.slice(textStart, upto)), textStart);
-    }
+    if (upto <= textStart) return;
+    pushChunk(esc(text.slice(textStart, upto)), textStart);
   }
   // Rebuild a delimiter's chunk from its current tags and leftover
   // literal length. Normally the close tags come first ("**a***" ->
@@ -2513,30 +2515,43 @@ function parseInline(text, refs, plain) {
     const lit = d.ch.repeat(d.len);
     const close = d.closeTags.join('');
     const open = d.openTags.join('');
-    chunks[d.chunk] = d.leftoverInside
-      ? lit + close + open
-      : close + lit + open;
+    if (d.leftoverInside) {
+      chunks[d.chunk] = lit + close + open;
+    } else {
+      chunks[d.chunk] = close + lit + open;
+    }
+  }
+  // Is there an active (unclosed) bracket? Delimiter suppression does
+  // not apply inside link text, which is tokenized in its own scope.
+  function hasActiveBracket() {
+    for (let b = brackets.length - 1; b >= 0; b--) {
+      if (brackets[b].active) return true;
+    }
+    return false;
   }
 
   while (i < n) {
     const c = text[i];
-    // Backslash escapes: \<newline> is a hard break (spaces/tabs after
-    // the newline are skipped too); \<punct> is the literal punctuation.
-    // Any other backslash is literal text.
+    // Backslash escapes.
     if (c === '\\') {
       const next = i + 1 < n ? text[i + 1] : '';
       if (next === '\n') {
+        // Backslash-newline is a hard break; spaces/tabs after the
+        // newline are skipped too.
         flushText(i);
         if (!plain) pushChunk('<br>', i);
-        i += 2;
-        while (i < n && isSpaceOrTab(text[i])) i++;
+        let k = i + 2;
+        while (k < n && isSpaceOrTab(text[k])) k++;
+        i = k;
         textStart = i;
       } else if (isAsciiPunct(next)) {
+        // Backslash-punctuation is the literal punctuation.
         flushText(i);
         pushChunk(esc(next), i);
         i += 2;
         textStart = i;
       } else {
+        // Any other backslash is literal text.
         i++;
       }
       continue;
@@ -2640,15 +2655,13 @@ function parseInline(text, refs, plain) {
       while (j < n && text[j] === c) j++;
       const runLen = j - i;
       const fl = flanking(text, i, j);
-      let canOpen;
-      let canClose;
-      if (c === '*') {
-        canOpen = fl.left;
-        canClose = fl.right;
-      } else {
-        canOpen = fl.left && (!fl.right || fl.beforePunct);
-        canClose = fl.right && (!fl.left || fl.afterPunct);
-      }
+      // '*' uses flanking directly; '_' cannot open or close intraword.
+      const canOpen = c === '*'
+        ? fl.left
+        : fl.left && (!fl.right || fl.beforePunct);
+      const canClose = c === '*'
+        ? fl.right
+        : fl.right && (!fl.left || fl.afterPunct);
       if ((canOpen || canClose) &&
           !(c === '_' && underscoreInEmail(text, i))) {
         flushText(i);
@@ -2656,10 +2669,7 @@ function parseInline(text, refs, plain) {
         pushChunk(text.slice(i, j), i);
         // The backtick-link emphasis suppression does not apply inside
         // a bracket (link text is tokenized in its own scope).
-        let inBracket = false;
-        for (let b = brackets.length - 1; b >= 0; b--) {
-          if (brackets[b].active) { inBracket = true; break; }
-        }
+        const inBracket = hasActiveBracket();
         delims.push({
           chunk: chunkIdx, ch: c, len: runLen, canOpen, canClose,
           scope: 0, openTags: [], closeTags: [],
@@ -2681,12 +2691,9 @@ function parseInline(text, refs, plain) {
       // delimiters) also blocks strikethrough: while a backtick remains
       // later in the text, a '~' run is literal. It does not apply
       // inside brackets.
-      let inBr = false;
-      if (suppressEmUntilTick && i < lastBacktick) {
-        for (let bi = brackets.length - 1; bi >= 0; bi--) {
-          if (brackets[bi].active) { inBr = true; break; }
-        }
-        if (!inBr) { i = j; continue; }
+      if (suppressEmUntilTick && i < lastBacktick && !hasActiveBracket()) {
+        i = j;
+        continue;
       }
       if ((runLen === 1 || runLen === 2) && flanking(text, i, j).left) {
         const closer = findTildeCloser(text, j, runLen);
