@@ -2667,6 +2667,11 @@ function parseInline(text, refs, plain) {
              (closer.canOpen && closer.canClose)) &&
             (opener.len + closer.len) % 3 === 0 &&
             (opener.len % 3 !== 0 || closer.len % 3 !== 0)) {
+          // Marked quirk: a closer that can also open STOPS its
+          // look-back at an odd-rule block (it stays available as an
+          // opener for a later closer instead of matching a farther
+          // opener). A can-only-close closer keeps looking back.
+          if (closer.canOpen) break;
           oi--;
           continue;
         }
