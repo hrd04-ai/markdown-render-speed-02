@@ -2300,6 +2300,19 @@ function parseInline(text, refs, plain) {
                 a.reverted = true;
               }
             }
+            // Extended www autolinks formed inside a strikethrough's
+            // recursive parse are not in autoLinks; revert them by
+            // their distinctive HTML (href is "http://" + text, so
+            // angle autolinks, whose href equals their text, never
+            // match). Email autolinks are left alone: a bare email
+            // and an angle email render identical HTML.
+            for (let cc = br.chunk + 1; cc < L; cc++) {
+              const ch = chunks[cc];
+              if (ch.includes('<a href="http://')) {
+                chunks[cc] = ch.replace(
+                  /<a href="http:\/\/([^"<]+)">\1<\/a>/g, '$1');
+              }
+            }
             if (plain) {
               chunks[br.chunk] = '';
             } else {
