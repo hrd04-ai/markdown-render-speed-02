@@ -1238,20 +1238,27 @@ function parseLinkDef(text) {
 // Does this list marker interrupt the current context? An unordered marker
 // always does; an ordered one only when it starts at 1 — unless we are
 // inside a list item, where any ordered marker interrupts.
+// Can this list marker interrupt a paragraph? Bullet markers and
+// ordered markers starting at 1 always can; other ordered markers can
+// only inside a list item.
 function listMarkerInterrupts(lm, inListItem) {
-  return !lm.ordered || lm.start === 1 || inListItem;
+  if (inListItem) return true;
+  if (!lm.ordered) return true;
+  return lm.start === 1;
 }
 
 // Can this line start a block that interrupts a paragraph?
 function interruptsParagraph(t, inListItem) {
-  if (matchFence(t) || matchATX(t) || matchHR(t)) return true;
+  if (matchFence(t)) return true;
+  if (matchATX(t)) return true;
+  if (matchHR(t)) return true;
   if (matchBlockquote(t) !== null) return true;
   const hm = matchHtmlBlock(t);
   if (hm && hm.type <= 6) return true;
   const lm = matchListMarker(t);
   // An empty list item (marker with no content) cannot interrupt a paragraph.
-  if (lm && !lm.empty && listMarkerInterrupts(lm, inListItem)) return true;
-  return false;
+  if (lm === null || lm.empty) return false;
+  return listMarkerInterrupts(lm, inListItem);
 }
 
 // Can this line be a table body row (i.e. does it NOT start a new block)?
@@ -1259,112 +1266,68 @@ function interruptsParagraph(t, inListItem) {
 // interrupting lists, and indented code.
 function isTableBodyRow(t) {
   if (matchBlockquote(t) !== null) return false;
-  if (matchATX(t) || matchFence(t) || matchHR(t)) return false;
+  if (matchATX(t)) return false;
+  if (matchFence(t)) return false;
+  if (matchHR(t)) return false;
   if (matchHtmlBlock(t)) return false;
   const lm = matchListMarker(t);
   if (lm && listMarkerInterrupts(lm, false)) return false;
   const [w] = leadingWs(t);
-  if (w >= 4) return false;
-  return true;
+  return w < 4;
 }
 
 // Extract leading link reference definitions from paragraph text,
 // recording them in refs (first definition wins). Returns the text
 // that remains after the definitions.
 function extractLinkDefs(text, refs) {
+  let rest = text;
   for (;;) {
-    const d = parseLinkDef(text);
-    if (!d) break;
-    if (!refs.has(d.label)) refs.set(d.label, { href: d.href, title: d.title });
-    text = text.slice(d.consumed);
+    const d = parseLinkDef(rest);
+    if (!d) return rest;
+    if (!refs.has(d.label)) {
+      refs.set(d.label, { href: d.href, title: d.title });
+    }
+    rest = rest.slice(d.consumed);
   }
-  return text;
 }
 
 // Collect table body rows starting at lines[k]. Returns {body, next}.
 function collectTableBody(lines, k, header) {
   const body = [];
+  const width = header.length;
   while (k < lines.length) {
     const L = lines[k];
     // Marked quirk: a terminated line of 0-3 spaces + a single tab is a
     // body row (empty cells), not a blank line ending the table.
     const tabRow = L.nl && /^ {0,3}\t$/.test(L.t);
-    if (!tabRow) {
-      if (isBlankLine(L)) break;
-      if (!isTableBodyRow(L.t)) break;
-    }
+    if (!tabRow && (isBlankLine(L) || !isTableBodyRow(L.t))) break;
     const cells = splitTableRow(L.t);
-    while (cells.length < header.length) cells.push('');
-    body.push(cells.slice(0, header.length));
+    while (cells.length < width) cells.push('');
+    body.push(cells.slice(0, width));
     k++;
   }
   return { body, next: k };
 }
 
-// Consume a paragraph starting at lines[i]. Handles setext headings, table
-// formation, and leading link reference definitions. Returns {blocks, next}.
-function consumeParagraph(lines, i, refs, inListItem) {
-  const paraLines = [lines[i].t];
-  let j = i + 1;
-  let endKind = 'blank';
-  let setextLevel = 0;
-  let tableAlign = null;
-  // Whether the previous continuation line was stripped (4+ leading
-  // columns removed by the list-item rule below).
-  let prevStripped = false;
-  while (j < lines.length) {
-    const L = lines[j];
-    const t = L.t;
-    if (isBlankLine(L)) {
-      endKind = 'blank';
-      break;
-    }
-    // Lazy lines never interrupt a paragraph or form setext/table.
-    if (L.lazy) {
-      paraLines.push(t);
-      prevStripped = false;
-      j++;
-      continue;
-    }
-    const headerCells = splitTableRow(paraLines[paraLines.length - 1]);
-    // A lazy delimiter line in a blockquote never forms a table, and a
-    // lazy setext-like line never becomes a setext underline.
-    const aligns = L.noTable ? null : matchTableDelimiter(t, headerCells.length);
-    if (aligns) {
-      endKind = 'table';
-      tableAlign = aligns;
-      break;
-    }
-    const sx = L.noSetext ? 0 : matchSetext(t);
-    if (sx) {
-      endKind = 'setext';
-      setextLevel = sx;
-      break;
-    }
-    if (interruptsParagraph(t, inListItem)) {
-      endKind = 'interrupt';
-      break;
-    }
-    // Marked quirk: inside a list item, a paragraph continuation line
-    // with 4+ columns of leading whitespace loses 4 columns (top-level
-    // paragraphs keep their leading whitespace as-is). A non-stripped
-    // continuation line following a stripped one is preceded by a
-    // blank line inside the paragraph.
-    if (inListItem) {
-      const [w] = leadingWs(t);
-      if (w >= 4) {
-        paraLines.push(stripIndent(t, 4));
-        prevStripped = true;
-        j++;
-        continue;
-      }
-      if (prevStripped) paraLines.push('');
-    }
-    prevStripped = false;
-    paraLines.push(t);
-    j++;
+// Handle one paragraph continuation line inside a list item. Marked
+// quirk: a continuation line with 4+ columns of leading whitespace loses
+// 4 columns (top-level paragraphs keep their leading whitespace as-is),
+// and a non-stripped continuation line following a stripped one is
+// preceded by a blank line inside the paragraph. Returns
+// {line, stripped, blankBefore}.
+function paraContinuationLine(t, inListItem, prevStripped) {
+  if (!inListItem) return { line: t, stripped: false, blankBefore: false };
+  const [w] = leadingWs(t);
+  if (w >= 4) {
+    return { line: stripIndent(t, 4), stripped: true, blankBefore: false };
   }
-  const text = extractLinkDefs(paraLines.join('\n'), refs);
+  return { line: t, stripped: false, blankBefore: prevStripped };
+}
+
+// Build the blocks for a finished paragraph. text is the paragraph text
+// after link definitions were extracted; how says how the paragraph
+// ended ('blank', 'interrupt', 'setext', 'table').
+function finishParagraph(lines, j, text, how, sxLevel, alignsOut) {
   const blocks = [];
   if (text === '') {
     // Only definitions: no paragraph. A setext/table line after definitions
@@ -1372,24 +1335,78 @@ function consumeParagraph(lines, i, refs, inListItem) {
     return { blocks, next: j };
   }
   const restLines = text.split('\n');
-  if (endKind === 'setext') {
+  if (how === 'setext') {
     // Setext heading text is trimmed (leading/trailing spaces/tabs).
     const trimmed = text.replace(/^[ \t]+|[ \t]+$/g, '');
-    blocks.push({ t: 'h', level: setextLevel, text: trimmed });
+    blocks.push({ t: 'h', level: sxLevel, text: trimmed });
     return { blocks, next: j + 1 };
   }
-  if (endKind === 'table') {
+  if (how === 'table') {
     const headerLine = restLines[restLines.length - 1];
     const header = splitTableRow(headerLine);
     if (restLines.length > 1) {
       blocks.push({ t: 'p', text: restLines.slice(0, -1).join('\n') });
     }
     const tb = collectTableBody(lines, j + 1, header);
-    blocks.push({ t: 'table', align: tableAlign, head: header, body: tb.body });
+    blocks.push({ t: 'table', align: alignsOut, head: header, body: tb.body });
     return { blocks, next: tb.next };
   }
   blocks.push({ t: 'p', text });
   return { blocks, next: j };
+}
+
+// Consume a paragraph starting at lines[i]. Handles setext headings, table
+// formation, and leading link reference definitions. Returns {blocks, next}.
+function consumeParagraph(lines, i, refs, inListItem) {
+  const collected = [lines[i].t];
+  let j = i + 1;
+  let how = 'blank';
+  let sxLevel = 0;
+  let alignsOut = null;
+  // Whether the previous continuation line was stripped (4+ leading
+  // columns removed by the list-item rule).
+  let strippedPrev = false;
+  while (j < lines.length) {
+    const L = lines[j];
+    const t = L.t;
+    if (isBlankLine(L)) {
+      how = 'blank';
+      break;
+    }
+    // Lazy lines never interrupt a paragraph or form setext/table.
+    if (L.lazy) {
+      collected.push(t);
+      strippedPrev = false;
+      j++;
+      continue;
+    }
+    const headerCells = splitTableRow(collected[collected.length - 1]);
+    // A lazy delimiter line in a blockquote never forms a table, and a
+    // lazy setext-like line never becomes a setext underline.
+    const aligns = L.noTable ? null : matchTableDelimiter(t, headerCells.length);
+    if (aligns) {
+      how = 'table';
+      alignsOut = aligns;
+      break;
+    }
+    const sx = L.noSetext ? 0 : matchSetext(t);
+    if (sx) {
+      how = 'setext';
+      sxLevel = sx;
+      break;
+    }
+    if (interruptsParagraph(t, inListItem)) {
+      how = 'interrupt';
+      break;
+    }
+    const cont = paraContinuationLine(t, inListItem, strippedPrev);
+    if (cont.blankBefore) collected.push('');
+    collected.push(cont.line);
+    strippedPrev = cont.stripped;
+    j++;
+  }
+  const text = extractLinkDefs(collected.join('\n'), refs);
+  return finishParagraph(lines, j, text, how, sxLevel, alignsOut);
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,30 +1418,35 @@ function consumeParagraph(lines, i, refs, inListItem) {
 // lines and '=' setext lines ARE lazy-able; '-' setext lines are caught by
 // the hr/list checks ('--' alone is lazy-able).
 function isLazyAble(t) {
-  return !matchATX(t) && !matchFence(t) && !matchHR(t) &&
-    matchBlockquote(t) === null && !matchHtmlBlock(t) &&
-    !matchListMarker(t);
+  if (matchATX(t)) return false;
+  if (matchFence(t)) return false;
+  if (matchHR(t)) return false;
+  if (matchBlockquote(t) !== null) return false;
+  if (matchHtmlBlock(t)) return false;
+  if (matchListMarker(t)) return false;
+  return true;
 }
 
 // Blockquote lazy-line stripping: strip 4 columns when the leading
 // whitespace is 4+ columns, else keep the line unchanged.
 function lazyStripQuote(t) {
   const [w] = leadingWs(t);
-  if (w < 4) return t;
-  return sliceFromCol(t, 4, false);
+  return w < 4 ? t : sliceFromCol(t, 4, false);
 }
 
 // The last leaf block under b (b itself unless it is a quote or list).
 function lastLeafOf(b) {
   if (b.t === 'quote') {
-    if (b.children.length === 0) return null;
-    return lastLeafOf(b.children[b.children.length - 1]);
+    const kids = b.children;
+    if (kids.length === 0) return null;
+    return lastLeafOf(kids[kids.length - 1]);
   }
   if (b.t === 'list') {
-    if (b.items.length === 0) return null;
-    const it = b.items[b.items.length - 1];
-    if (it.children.length === 0) return null;
-    return lastLeafOf(it.children[it.children.length - 1]);
+    const items = b.items;
+    if (items.length === 0) return null;
+    const lastItem = items[items.length - 1];
+    if (lastItem.children.length === 0) return null;
+    return lastLeafOf(lastItem.children[lastItem.children.length - 1]);
   }
   return b;
 }
@@ -1441,7 +1463,8 @@ function lastLeaf(blocks) {
 function endsWithOpenParagraph(blocks, lastLineBlank) {
   if (lastLineBlank) return false;
   const leaf = lastLeaf(blocks);
-  return leaf !== null && leaf.t === 'p';
+  if (leaf === null) return false;
+  return leaf.t === 'p';
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,26 +1477,60 @@ function endsWithOpenParagraph(blocks, lastLineBlank) {
 // by 4. Returns {text, stripped}.
 function lazySetextLine(t, prevLazy, prevStripped) {
   if (!prevLazy) return { text: t, stripped: false };
-  if (!prevStripped) {
-    const [w] = leadingWs(t);
-    return { text: ' '.repeat(Math.max(0, 4 - w)) + t, stripped: false };
+  if (prevStripped) {
+    return { text: stripIndent(t, 4), stripped: true };
   }
-  return { text: stripIndent(t, 4), stripped: true };
+  const [w] = leadingWs(t);
+  const pad = Math.max(0, 4 - w);
+  return { text: ' '.repeat(pad) + t, stripped: false };
+}
+
+// Append one lazy continuation line to a blockquote's inner lines,
+// applying the lazy-strip / padding rules. state carries {prevLazy,
+// prevStripped} and is updated in place. insertBlank is called when a
+// short lazy line follows a stripped one (a blank line goes first).
+function pushLazyQuoteLine(inner, L, state, insertBlank) {
+  const t = L.t;
+  const [w] = leadingWs(t);
+  if (matchSetext(t)) {
+    // A lazy setext-like line never becomes a setext underline.
+    const sl = lazySetextLine(t, state.prevLazy, state.prevStripped);
+    inner.push({ t: sl.text, nl: L.nl, noSetext: true, lazy: true });
+    state.prevLazy = true;
+    state.prevStripped = sl.stripped;
+    return;
+  }
+  if (state.prevLazy && state.prevStripped && w < 4) {
+    // A short lazy line after a stripped one: blank line first, kept as-is.
+    insertBlank();
+    inner.push({ t, nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
+    state.prevLazy = true;
+    state.prevStripped = false;
+    return;
+  }
+  if (w >= 4) {
+    inner.push({ t: lazyStripQuote(t), nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
+    state.prevLazy = true;
+    state.prevStripped = true;
+    return;
+  }
+  inner.push({ t, nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
+  state.prevLazy = true;
+  state.prevStripped = false;
 }
 
 // Consume a blockquote starting at lines[i].
 function consumeQuote(lines, i, refs) {
-  const inner = [];
+  const collected = [];
   let j = i;
-  let needCheck = true;
+  let checkNeeded = true;
   let paraOpen = false;
-  let prevLazy = false;
-  let prevStripped = false;
+  const lazyState = { prevLazy: false, prevStripped: false };
   // A blank line after a stripped lazy line lands INSIDE the open paragraph
   // (as a trailing newline on the last inner line).
   function insertBlank() {
-    if (inner.length > 0) {
-      const last = inner[inner.length - 1];
+    if (collected.length > 0) {
+      const last = collected[collected.length - 1];
       if (!isBlankLine(last)) last.t += '\n';
     }
   }
@@ -1481,56 +1538,37 @@ function consumeQuote(lines, i, refs) {
     const L = lines[j];
     const q = matchBlockquote(L.t);
     if (q !== null) {
-      if (prevLazy && prevStripped) insertBlank();
-      inner.push({ t: q, nl: L.nl });
+      if (lazyState.prevLazy && lazyState.prevStripped) insertBlank();
+      collected.push({ t: q, nl: L.nl });
       j++;
-      needCheck = true;
-      prevLazy = false;
-      prevStripped = false;
+      checkNeeded = true;
+      lazyState.prevLazy = false;
+      lazyState.prevStripped = false;
       continue;
     }
     if (isBlankLine(L)) break;
     if (!isLazyAble(L.t)) break;
-    if (needCheck) {
-      const blocks = parseBlocks(inner, new Map());
-      const lastBlank = inner.length > 0 && isBlankLine(inner[inner.length - 1]);
+    if (checkNeeded) {
+      const blocks = parseBlocks(collected, new Map());
+      const lastBlank = collected.length > 0 && isBlankLine(collected[collected.length - 1]);
       paraOpen = endsWithOpenParagraph(blocks, lastBlank);
-      needCheck = false;
+      checkNeeded = false;
       if (!paraOpen) break;
     }
-    const t = L.t;
-    const [w] = leadingWs(t);
-    if (matchSetext(t)) {
-      // A lazy setext-like line never becomes a setext underline.
-      const sl = lazySetextLine(t, prevLazy, prevStripped);
-      inner.push({ t: sl.text, nl: L.nl, noSetext: true, lazy: true });
-      prevLazy = true;
-      prevStripped = sl.stripped;
-    } else if (prevLazy && prevStripped && w < 4) {
-      // A short lazy line after a stripped one: blank line first, kept as-is.
-      insertBlank();
-      inner.push({ t, nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
-      prevLazy = true;
-      prevStripped = false;
-    } else if (w >= 4) {
-      inner.push({ t: lazyStripQuote(t), nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
-      prevLazy = true;
-      prevStripped = true;
-    } else {
-      inner.push({ t, nl: L.nl, noTable: looksLikeTableDelimiter(t), lazy: true });
-      prevLazy = true;
-      prevStripped = false;
-    }
+    pushLazyQuoteLine(collected, L, lazyState, insertBlank);
     j++;
   }
-  if (inner.length > 0) inner[inner.length - 1].nl = false;
-  const children = parseBlocks(inner, refs);
+  if (collected.length > 0) collected[collected.length - 1].nl = false;
+  const children = parseBlocks(collected, refs);
   return { block: { t: 'quote', children }, next: j };
 }
 
 // Do the collected item lines contain any non-blank line yet?
 function itemLinesHaveContent(itemLines) {
-  return itemLines.some((il) => !isBlankLine(il));
+  for (const il of itemLines) {
+    if (!isBlankLine(il)) return true;
+  }
+  return false;
 }
 
 // While a fence is open with content, an under-indented line is fence
@@ -1546,18 +1584,46 @@ function fenceCaptureBlocked(prev) {
   if (/^#{1,6}(?:[ \t]|$)/.test(ps)) return true;
   if (/^(-{3,}|_{3,}|\*{3,})[ \t]*$/.test(ps)) return true;
   if (/^(`{3,}|~{3,})/.test(ps)) return true;
-  if (matchHtmlBlock(pt) !== null) return true;
-  return false;
+  return matchHtmlBlock(pt) !== null;
 }
 
 // Task list: if the first child is a paragraph starting with [x]/[ ]/[X]
 // + space/tab + content, strip the marker and return the task state.
 function extractTask(children) {
-  if (children.length === 0 || children[0].t !== 'p') return null;
-  const tm = /^\[([ xX])\][ \t]+(\S[\s\S]*)$/.exec(children[0].text);
+  if (children.length === 0) return null;
+  const first = children[0];
+  if (first.t !== 'p') return null;
+  const tm = /^\[([ xX])\][ \t]+(\S[\s\S]*)$/.exec(first.text);
   if (!tm) return null;
-  children[0].text = tm[2];
+  first.text = tm[2];
   return tm[1] === ' ' ? 'unchecked' : 'checked';
+}
+
+// Advance fence state for one stripped item line: open a fence when one
+// starts here, close it at a matching closing fence. state is
+// {ch, len, hasContent} and is updated in place.
+function trackItemFence(state, stripped) {
+  if (state.ch === null) {
+    const fm = matchFence(stripped);
+    if (fm) {
+      state.ch = fm.ch;
+      state.len = fm.len;
+      state.hasContent = false;
+    }
+    return;
+  }
+  if (isClosingFence(stripped, state.ch, state.len)) {
+    state.ch = null;
+    state.len = 0;
+    state.hasContent = false;
+  }
+}
+
+// Find the index of the next non-blank line at or after k (lines.length
+// when there is none).
+function nextNonBlank(lines, k) {
+  while (k < lines.length && isBlankLine(lines[k])) k++;
+  return k;
 }
 
 // Collect one list item starting at lines[j] (marker m). Returns
@@ -1569,27 +1635,11 @@ function collectItem(lines, j, m, refs) {
   // at least one content line, under-indented non-fence lines are fence
   // content (they stay in the item). If the first line after the fence
   // open is under-indented, the item ends and the fence is empty.
-  let fenceCh = null;
-  let fenceLen = 0;
-  let fenceHasContent = false;
+  const fence = { ch: null, len: 0, hasContent: false };
   const fm0 = matchFence(m.content);
   if (fm0) {
-    fenceCh = fm0.ch;
-    fenceLen = fm0.len;
-  }
-  function trackFence(stripped) {
-    if (fenceCh === null) {
-      const fm = matchFence(stripped);
-      if (fm) {
-        fenceCh = fm.ch;
-        fenceLen = fm.len;
-        fenceHasContent = false;
-      }
-    } else if (isClosingFence(stripped, fenceCh, fenceLen)) {
-      fenceCh = null;
-      fenceLen = 0;
-      fenceHasContent = false;
-    }
+    fence.ch = fm0.ch;
+    fence.len = fm0.len;
   }
   let k = j + 1;
   let needCheck = false;
@@ -1603,8 +1653,7 @@ function collectItem(lines, j, m, refs) {
       // content indent (a blank line breaks fence-content capture).
       // An item with no content yet ends at a blank line (it stays empty).
       if (!itemLinesHaveContent(itemLines)) break;
-      let m2 = k + 1;
-      while (m2 < lines.length && isBlankLine(lines[m2])) m2++;
+      const m2 = nextNonBlank(lines, k + 1);
       if (m2 >= lines.length) break;
       const [w2] = leadingWs(lines[m2].t);
       if (w2 >= contentIndent && !isBlankStart(lines[m2].t)) {
@@ -1618,10 +1667,10 @@ function collectItem(lines, j, m, refs) {
     const [w] = leadingWs(t);
     if (w >= contentIndent && !isBlankStart(t)) {
       const stripped = sliceFromCol(t, contentIndent, true);
-      const fenceWasOpen = fenceCh !== null;
+      const fenceWasOpen = fence.ch !== null;
       itemLines.push({ t: stripped, nl: L.nl });
-      trackFence(stripped);
-      if (fenceWasOpen && fenceCh !== null) fenceHasContent = true;
+      trackItemFence(fence, stripped);
+      if (fenceWasOpen && fence.ch !== null) fence.hasContent = true;
       k++;
       needCheck = true;
       continue;
@@ -1629,7 +1678,7 @@ function collectItem(lines, j, m, refs) {
     // While a fence is open with content, an under-indented line that is
     // not itself a fence line is fence content (kept as-is). A fence line
     // ends the item. (See fenceCaptureBlocked for the leaf-block exception.)
-    if (fenceCh !== null && fenceHasContent && matchFence(t) === null) {
+    if (fence.ch !== null && fence.hasContent && matchFence(t) === null) {
       const prev = itemLines[itemLines.length - 1];
       if (!fenceCaptureBlocked(prev)) {
         itemLines.push({ t, nl: L.nl });
@@ -1670,8 +1719,10 @@ function collectItem(lines, j, m, refs) {
 // Does this marker belong to the list (same kind/delimiter, indent below
 // the previous item's content indent)? Items need not share one indent.
 function markerBelongsToList(m, ordered, delim, prevContentIndent) {
-  return m !== null && m.indent < prevContentIndent &&
-    m.ordered === ordered && m.delim === delim;
+  if (m === null) return false;
+  if (m.indent >= prevContentIndent) return false;
+  if (m.ordered !== ordered) return false;
+  return m.delim === delim;
 }
 
 // Consume a list starting at lines[i] (first marker already matched).
@@ -1689,8 +1740,7 @@ function consumeList(lines, i, refs) {
   while (j < lines.length) {
     const L = lines[j];
     if (isBlankLine(L)) {
-      let k = j + 1;
-      while (k < lines.length && isBlankLine(lines[k])) k++;
+      const k = nextNonBlank(lines, j + 1);
       if (k >= lines.length) break;
       const nm = matchListMarker(lines[k].t);
       if (nm && !matchHR(lines[k].t) &&
@@ -1726,31 +1776,31 @@ function consumeList(lines, i, refs) {
 // ---------------------------------------------------------------------------
 
 function parseBlocks(lines, refs, inListItem) {
-  const blocks = [];
-  blocks.hasBlankBetween = false;
+  const out = [];
+  out.hasBlankBetween = false;
   let i = 0;
   const n = lines.length;
-  let blankSinceLastBlock = false;
-  function pushBlock(b) {
-    if (blankSinceLastBlock) blocks.hasBlankBetween = true;
-    blankSinceLastBlock = false;
-    blocks.push(b);
+  let sawBlank = false;
+  function addBlock(b) {
+    if (sawBlank) out.hasBlankBetween = true;
+    sawBlank = false;
+    out.push(b);
   }
   // Consume a paragraph at lines[at] and push its blocks, tracking the
   // blank-between state for looseness. Returns the next line index.
-  function consumeParaAt(at) {
+  function paraAt(at) {
     const r = consumeParagraph(lines, at, refs, inListItem);
-    for (const b of r.blocks) pushBlock(b);
-    if (r.blocks.length === 0 && blankSinceLastBlock) {
-      blocks.hasBlankBetween = true;
-      blankSinceLastBlock = false;
+    for (const b of r.blocks) addBlock(b);
+    if (r.blocks.length === 0 && sawBlank) {
+      out.hasBlankBetween = true;
+      sawBlank = false;
     }
     return r.next;
   }
   while (i < n) {
     const L = lines[i];
     if (isBlankLine(L) || isBlankStart(L.t)) {
-      if (blocks.length > 0) blankSinceLastBlock = true;
+      if (out.length > 0) sawBlank = true;
       i++;
       continue;
     }
@@ -1758,57 +1808,57 @@ function parseBlocks(lines, refs, inListItem) {
     // A lazy continuation line is paragraph text, never a new block
     // (even if stripping made it look like a list marker or heading).
     if (L.lazy) {
-      i = consumeParaAt(i);
+      i = paraAt(i);
       continue;
     }
-    let m = matchFence(t);
-    if (m) {
-      const r = consumeFence(lines, i, m);
-      pushBlock(r.block);
+    const fence = matchFence(t);
+    if (fence) {
+      const r = consumeFence(lines, i, fence);
+      addBlock(r.block);
       i = r.next;
       continue;
     }
-    m = matchATX(t);
-    if (m) {
-      pushBlock({ t: 'h', level: m.level, text: m.text });
+    const atx = matchATX(t);
+    if (atx) {
+      addBlock({ t: 'h', level: atx.level, text: atx.text });
       i++;
       continue;
     }
-    m = matchHtmlBlock(t);
-    if (m) {
-      const r = consumeHtml(lines, i, m);
-      pushBlock(r.block);
+    const html = matchHtmlBlock(t);
+    if (html) {
+      const r = consumeHtml(lines, i, html);
+      addBlock(r.block);
       i = r.next;
       continue;
     }
     if (matchHR(t)) {
-      pushBlock({ t: 'hr' });
+      addBlock({ t: 'hr' });
       i++;
       continue;
     }
     if (matchBlockquote(t) !== null) {
       const r = consumeQuote(lines, i, refs);
-      pushBlock(r.block);
+      addBlock(r.block);
       i = r.next;
       continue;
     }
-    m = matchListMarker(t);
-    if (m) {
+    const list = matchListMarker(t);
+    if (list) {
       const r = consumeList(lines, i, refs);
-      pushBlock(r.block);
+      addBlock(r.block);
       i = r.next;
       continue;
     }
     const [w] = leadingWs(t);
     if (w >= 4) {
       const r = consumeIndentedCode(lines, i);
-      pushBlock(r.block);
+      addBlock(r.block);
       i = r.next;
       continue;
     }
-    i = consumeParaAt(i);
+    i = paraAt(i);
   }
-  return blocks;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
