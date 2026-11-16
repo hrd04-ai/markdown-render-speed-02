@@ -132,6 +132,11 @@ const ESCAPE_MAP = {
   "'": '&#39;',
 };
 
+// Characters that always escape in HTML text, as a fast pre-test: when
+// none of them occur, the string is returned untouched without
+// allocating anything.
+const ESCAPABLE_RE = /[&<>"']/;
+
 // Shared escape scanner behind escapeText and escapeNoEncode. It walks the
 // string once, copying untouched runs verbatim and substituting only the
 // characters in ESCAPE_MAP. When preserveEntities is set, an '&' that
@@ -139,6 +144,7 @@ const ESCAPE_MAP = {
 // nothing to escape is returned untouched.
 function escapeScan(s, preserveEntities) {
   if (!s) return s;
+  if (!ESCAPABLE_RE.test(s)) return s;
   const parts = [];
   let start = 0;
   for (let i = 0; i < s.length; i++) {
