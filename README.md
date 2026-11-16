@@ -50,8 +50,8 @@ marked's output before the timing counts.
 
 Result on this machine (Node 22, interleaved rounds against the same
 cases, final code): **720/720 byte-identical**, and the entry runs
-**about 1.4× faster** than marked (fastest full-set runs 491–507 ms vs
-689–723 ms for marked; medians 556–580 ms vs 791–874 ms). The speed
+**about 1.5–1.6× faster** than marked (fastest full-set runs 453–454 ms
+vs 716–728 ms for marked; medians 543–561 ms vs 837–941 ms). The speed
 comes from the single-pass inline walk, cheap character-class checks
 (code-point ranges instead of regexes on the hot path), and rendering
 straight into a chunk array instead of building an AST.
