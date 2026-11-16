@@ -1984,8 +1984,17 @@ function parseInline(text, refs, plain) {
     }
   }
   function rebuildDelim(d) {
-    chunks[d.chunk] =
-      d.closeTags.join('') + d.ch.repeat(d.len) + d.openTags.join('');
+    // Normally close tags come first ("**a***" -> "<strong>a</strong>*").
+    // But when a recorded em span lies between this closer's opener and
+    // the closer, the leftover literals render inside the element
+    // ("**a *b*c***" -> "<strong>a <em>b</em>c*</strong>").
+    if (d.leftoverInside) {
+      chunks[d.chunk] =
+        d.ch.repeat(d.len) + d.closeTags.join('') + d.openTags.join('');
+    } else {
+      chunks[d.chunk] =
+        d.closeTags.join('') + d.ch.repeat(d.len) + d.openTags.join('');
+    }
   }
 
   while (i < n) {
@@ -2518,7 +2527,17 @@ function parseInline(text, refs, plain) {
         opener.len -= use;
         closer.len -= use;
         if (use === 1 && closer.canOpen) emSpans.push([oi, di, closer.ch]);
-        if (use === 2) strongPairs.push([oi, di]);
+        if (use === 2) {
+          strongPairs.push([oi, di]);
+          // A recorded em span between the opener and closer moves the
+          // closer's leftover literals inside the strong element.
+          for (const s of emSpans) {
+            if (s[2] === closer.ch && oi < s[0] && s[1] < di) {
+              closer.leftoverInside = true;
+              break;
+            }
+          }
+        }
         if (!plain) {
           opener.openTags.unshift(use === 2 ? '<strong>' : '<em>');
           closer.closeTags.push(use === 2 ? '</strong>' : '</em>');
