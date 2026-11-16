@@ -2019,6 +2019,10 @@ function parseInline(text, refs, plain) {
   // whose closer is at the end of the del content, optionally followed
   // by letters). Such a del blocks an enclosing * em match.
   const blockingDels = [];
+  // Chunk indices of <del> elements whose content ends with a * em
+  // (closer at the end, optionally followed by letters). Such a del
+  // blocks an enclosing ** strong match.
+  const blockingDelsStrong = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
   // run, emphasis delimiters are suppressed while a backtick remains
   // later in the text (not just until the next backtick run: a later
@@ -2269,11 +2273,19 @@ function parseInline(text, refs, plain) {
           // (opener preceded by a space, closer at the end, optionally
           // followed by letters) blocks an enclosing * em match. A
           // __ strong does not block (different delimiter char).
-          if (!plain && /<\/strong>[A-Za-z0-9]*$/.test(inner) &&
-              /\*\*[A-Za-z0-9]*$/.test(text.slice(j, closer))) {
-            const sIdx = inner.lastIndexOf('<strong>');
-            if (sIdx > 0 && inner[sIdx - 1] === ' ') {
-              blockingDels.push(chunks.length);
+          // A del whose content ends with a * em blocks an enclosing
+          // ** strong match.
+          if (!plain) {
+            const content = text.slice(j, closer);
+            if (/<\/strong>[A-Za-z0-9]*$/.test(inner) &&
+                /\*\*[A-Za-z0-9]*$/.test(content)) {
+              const sIdx = inner.lastIndexOf('<strong>');
+              if (sIdx > 0 && inner[sIdx - 1] === ' ') {
+                blockingDels.push(chunks.length);
+              }
+            } else if (/<\/em>$/.test(inner) &&
+                       /[^\*]\*$/.test(content)) {
+              blockingDelsStrong.push({ chunk: chunks.length, fails: 0 });
             }
           }
           if (!plain) pushChunk('<del>', i);
@@ -2679,6 +2691,7 @@ function parseInline(text, refs, plain) {
     if (closer.dead || closer.len === 0 || !closer.canClose) continue;
     const startLen = closer.len;
     const blockedBy = [];
+    const blockedByDel = [];
     let oi = di - 1;
     while (oi >= 0 && closer.len > 0) {
       const opener = delims[oi];
@@ -2754,6 +2767,20 @@ function parseInline(text, refs, plain) {
           }
           if (blocked) { oi--; continue; }
         }
+        // A del ending in a * em blocks an enclosing ** strong match.
+        // The block lifts after one closer fails against it.
+        if (use === 2 && closer.ch === '*') {
+          let blockedStrong = false;
+          for (const dc of blockingDelsStrong) {
+            if (dc.fails >= 1) continue;
+            if (opener.chunk < dc.chunk && dc.chunk < closer.chunk) {
+              blockedStrong = true;
+              if (!blockedByDel.includes(dc)) blockedByDel.push(dc);
+              break;
+            }
+          }
+          if (blockedStrong) { oi--; continue; }
+        }
         opener.len -= use;
         closer.len -= use;
         if (use === 1 && closer.canOpen) emSpans.push([oi, di, closer.ch]);
@@ -2793,6 +2820,10 @@ function parseInline(text, refs, plain) {
         if (p.fails >= 2) lifted = true;
       }
       if (lifted && closer.canOpen) closer.dead = true;
+    }
+    // A closer that failed against a del-strong block lifts the block.
+    if (closer.len === startLen) {
+      for (const dc of blockedByDel) dc.fails++;
     }
   }
 
