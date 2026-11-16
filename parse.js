@@ -790,19 +790,9 @@ function consumeFence(lines, i, m) {
   let j = i + 1;
   while (j < lines.length) {
     const t = lines[j].t;
-    // Closing fence: same char, run >= opening, only spaces/tabs after.
-    let k = 0;
-    while (k < t.length && t[k] === ' ' && k < 3) k++;
-    if (k < t.length && t[k] !== '\t') {
-      let r = k;
-      while (r < t.length && t[r] === m.ch) r++;
-      if (r - k >= m.len) {
-        let ok = true;
-        for (let q = r; q < t.length; q++) {
-          if (!isSpaceOrTab(t[q])) { ok = false; break; }
-        }
-        if (ok) { j++; break; }
-      }
+    if (isClosingFence(t, m.ch, m.len)) {
+      j++;
+      break;
     }
     // Marked quirk: only backtick fences strip the opening indent from
     // content lines; tilde fences keep content verbatim. Tabs count as
@@ -823,16 +813,13 @@ function consumeHtml(lines, i, m) {
   if (m.type <= 5) {
     // Ends at the line containing the terminator (inclusive).
     const end = m.end.toLowerCase();
-    for (; k < n; k++) {
-      if (lines[k].t.toLowerCase().indexOf(end) !== -1) break;
-    }
+    while (k < n && lines[k].t.toLowerCase().indexOf(end) === -1) k++;
     if (k >= n) k = n - 1;
   } else {
     // Types 6-7: ends at a blank line (or end of input).
-    for (; k < n; k++) {
-      if (k > i && isBlankLine(lines[k])) { k--; break; }
-    }
-    if (k >= n) k = n - 1;
+    k = i + 1;
+    while (k < n && !isBlankLine(lines[k])) k++;
+    k--;
   }
   let text = '';
   for (let q = i; q <= k; q++) {
@@ -856,28 +843,27 @@ function consumeHtml(lines, i, m) {
 // Indented code block starting at lines[i].
 function consumeIndentedCode(lines, i) {
   const content = [];
+  let pendingBlanks = [];
   let j = i;
-  let lastNonBlank = -1;
   let next = i;
   while (j < lines.length) {
     const L = lines[j];
     if (isBlankLine(L)) {
       // A whitespace-only line contributes the part after 4 columns
-      // (e.g. 6 spaces -> 2 spaces), not an empty line.
-      content.push(sliceFromCol(L.t, 4, false));
+      // (e.g. 6 spaces -> 2 spaces), not an empty line. It only joins
+      // the block when a non-blank line follows it.
+      pendingBlanks.push(sliceFromCol(L.t, 4, false));
       j++;
       continue;
     }
     const [w] = leadingWs(L.t);
     if (w < 4) break;
-    content.push(sliceFromCol(L.t, 4, false));
-    lastNonBlank = content.length - 1;
+    content.push(...pendingBlanks, sliceFromCol(L.t, 4, false));
+    pendingBlanks = [];
     next = j + 1;
     j++;
   }
-  // Strip trailing blank lines (they stay outside the block).
-  const kept = lastNonBlank < 0 ? [] : content.slice(0, lastNonBlank + 1);
-  const text = kept.length === 0 ? '' : kept.join('\n') + '\n';
+  const text = content.length === 0 ? '' : content.join('\n') + '\n';
   return { block: { t: 'code', text }, next };
 }
 
@@ -891,29 +877,113 @@ function consumeIndentedCode(lines, i) {
 function parseTitle(text, i, isInline) {
   const n = text.length;
   const q = text[i];
+  const closer = q === '(' ? ')' : q;
+  const allowOpen = q !== '(' || isInline;
   let title = '';
   let j = i + 1;
-  if (q === '"' || q === "'") {
-    while (j < n) {
-      const c = text[j];
-      if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
-        title += text[j + 1];
-        j += 2;
-      } else if (c === q) return { title, end: j + 1 };
-      else { title += c; j++; }
-    }
-    return null;
-  }
   while (j < n) {
     const c = text[j];
     if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
       title += text[j + 1];
       j += 2;
-    } else if (c === ')') return { title, end: j + 1 };
-    else if (c === '(' && !isInline) return null;
-    else { title += c; j++; }
+      continue;
+    }
+    if (c === closer) return { title, end: j + 1 };
+    if (c === '(' && !allowOpen) return null;
+    title += c;
+    j++;
   }
   return null;
+}
+
+// Scan a link-definition label starting just after '['. Escapes stay RAW
+// in the label (for matching); an escaped \] does not end it and an
+// escaped \[ does not invalidate it. Returns {label, end} (end = index
+// after ']') or null.
+function scanDefLabel(text, i) {
+  const n = text.length;
+  let label = '';
+  while (i < n) {
+    const c = text[i];
+    if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
+      label += text[i] + text[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === '[') return null;
+    if (c === ']') return { label, end: i + 1 };
+    label += c;
+    i++;
+  }
+  return null;
+}
+
+// Skip the gap after ':' in a link definition: spaces, optionally one
+// newline + spaces/tabs. Returns the index after the gap, or -1 when a
+// second newline follows.
+function skipDefGap(text, i) {
+  const n = text.length;
+  while (i < n && text[i] === ' ') i++;
+  if (i < n && text[i] === '\n') {
+    i++;
+    while (i < n && isSpaceOrTab(text[i])) i++;
+    if (i < n && text[i] === '\n') return -1;
+  }
+  return i;
+}
+
+// Scan a link destination starting at text[i]. Angle form <...> (no
+// newlines, no '<' inside, escapes resolved) or bare form (balanced
+// parens, no spaces/control chars, escapes resolved). Returns
+// {dest, end} or null.
+function scanLinkDest(text, i) {
+  const n = text.length;
+  if (text[i] === '<') {
+    let dest = '';
+    i++;
+    while (i < n) {
+      const c = text[i];
+      if (c === '\n' || c === '<') return null;
+      if (c === '>') return { dest, end: i + 1 };
+      if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
+        dest += text[i + 1];
+        i += 2;
+      } else {
+        dest += c;
+        i++;
+      }
+    }
+    return null;
+  }
+  let dest = '';
+  let depth = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
+      dest += text[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === '(') {
+      depth++;
+      dest += c;
+      i++;
+      continue;
+    }
+    if (c === ')') {
+      if (depth === 0) break;
+      depth--;
+      dest += c;
+      i++;
+      continue;
+    }
+    const code = c.charCodeAt(0);
+    if (c === ' ' || c === '\t' || c === '\n' || code < 0x20) break;
+    dest += c;
+    i++;
+  }
+  if (dest === '' || depth !== 0) return null;
+  return { dest, end: i };
 }
 
 // Parse a link reference definition from the start of text (joined paragraph
@@ -925,70 +995,18 @@ function parseLinkDef(text) {
   let sp = 0;
   while (i < n && text[i] === ' ' && sp < 3) { i++; sp++; }
   if (i >= n || text[i] !== '[') return null;
-  i++;
-  let label = '';
-  let closed = false;
-  while (i < n) {
-    const c = text[i];
-    if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-      // Escapes are kept RAW in the label (for matching); a \] does not
-      // end the label, a \[ does not invalidate it.
-      label += text[i];
-      label += text[i + 1];
-      i += 2;
-    } else if (c === '[') return null;
-    else if (c === ']') { closed = true; i++; break; }
-    else { label += c; i++; }
-  }
-  if (!closed) return null;
-  const normLabel = normalizeLabel(label);
+  const lab = scanDefLabel(text, i + 1);
+  if (!lab) return null;
+  const normLabel = normalizeLabel(lab.label);
   if (normLabel === '') return null;
+  i = lab.end;
   if (i >= n || text[i] !== ':') return null;
-  i++;
-  // Gap after ':': spaces, optionally one newline + spaces/tabs.
-  while (i < n && text[i] === ' ') i++;
-  if (i < n && text[i] === '\n') {
-    i++;
-    while (i < n && isSpaceOrTab(text[i])) i++;
-    if (i < n && text[i] === '\n') return null;
-  }
-  if (i >= n) return null;
-  // Destination.
-  let dest = '';
-  if (text[i] === '<') {
-    i++;
-    let ok = false;
-    while (i < n) {
-      const c = text[i];
-      if (c === '\n' || c === '<') return null;
-      if (c === '>') { ok = true; i++; break; }
-      if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-        dest += text[i + 1];
-        i += 2;
-      } else { dest += c; i++; }
-    }
-    if (!ok) return null;
-  } else {
-    let depth = 0;
-    while (i < n) {
-      const c = text[i];
-      if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) {
-        dest += text[i + 1];
-        i += 2;
-        continue;
-      }
-      if (c === '(') { depth++; dest += c; i++; continue; }
-      if (c === ')') {
-        if (depth === 0) break;
-        depth--; dest += c; i++; continue;
-      }
-      const code = c.charCodeAt(0);
-      if (c === ' ' || c === '\t' || c === '\n' || code < 0x20) break;
-      dest += c;
-      i++;
-    }
-    if (dest === '' || depth !== 0) return null;
-  }
+  i = skipDefGap(text, i + 1);
+  if (i === -1 || i >= n) return null;
+  const d = scanLinkDest(text, i);
+  if (!d) return null;
+  const dest = d.dest;
+  i = d.end;
   // Optional title: same line (after spaces) or next line (after newline).
   // A same-line title needs at least one space before it, and a failed
   // same-line title kills the whole definition. A failed next-line title
