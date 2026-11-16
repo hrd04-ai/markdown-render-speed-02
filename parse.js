@@ -2721,6 +2721,9 @@ function parseInline(text, refs, plain) {
             if (p.fails >= 2) continue;
             if (oi < p.oi && p.di < di) {
               const pop = delims[p.oi], pcl = delims[p.di];
+              // A pair inside a link (different scope) does not block
+              // an outer match.
+              if (pop.scope !== closer.scope) continue;
               if (!pop.dead && !pcl.dead && pcl.canOpen && !pop.canClose &&
                   pop.ch === '*') {
                 let firstUsed = false;
