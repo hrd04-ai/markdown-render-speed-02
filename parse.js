@@ -1976,8 +1976,11 @@ function parseInline(text, refs, plain) {
   // ends with a closed code span).
   const codeSpans = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
-  // run, emphasis delimiters are suppressed until the next backtick run.
+  // run, emphasis delimiters are suppressed while a backtick remains
+  // later in the text (not just until the next backtick run: a later
+  // backtick keeps the suppression active).
   let suppressEmUntilTick = false;
+  const lastBacktick = text.lastIndexOf('`');
   let scopeCounter = 0;
   let i = 0;
   let textStart = 0;
@@ -2029,7 +2032,6 @@ function parseInline(text, refs, plain) {
     }
     // Code spans.
     if (c === '`') {
-      suppressEmUntilTick = false;
       let j = i;
       while (j < n && text[j] === '`') j++;
       const runLen = j - i;
@@ -2126,7 +2128,7 @@ function parseInline(text, refs, plain) {
         delims.push({
           chunk: chunkIdx, ch: c, len: runLen, canOpen, canClose,
           scope: 0, openTags: [], closeTags: [],
-          dead: suppressEmUntilTick && !inBracket,
+          dead: suppressEmUntilTick && !inBracket && i < lastBacktick,
         });
         i = j;
         textStart = i;
