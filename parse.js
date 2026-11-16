@@ -2166,6 +2166,17 @@ function parseInline(text, refs, plain) {
       let j = i;
       while (j < n && text[j] === '~') j++;
       const runLen = j - i;
+      // The link-with-unclosed-backticks suppression (see the emphasis
+      // delimiters) also blocks strikethrough: while a backtick remains
+      // later in the text, a '~' run is literal. It does not apply
+      // inside brackets.
+      let inBr = false;
+      if (suppressEmUntilTick && i < lastBacktick) {
+        for (let bi = brackets.length - 1; bi >= 0; bi--) {
+          if (brackets[bi].active) { inBr = true; break; }
+        }
+        if (!inBr) { i = j; continue; }
+      }
       if ((runLen === 1 || runLen === 2) && flanking(text, i, j).left) {
         const closer = findTildeCloser(text, j, runLen);
         if (closer !== -1) {
