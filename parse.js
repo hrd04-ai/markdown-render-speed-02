@@ -2159,7 +2159,8 @@ function findTildeCloser(text, from, len) {
   return -1;
 }
 
-// Parse inline content. plain=true renders plain text (image alt text).
+// Parse inline content into HTML. With plain=true it renders plain text
+// (image alt text: no tags, no-encode escaping).
 function parseInline(text, refs, plain) {
   const n = text.length;
   const esc = plain ? escapeNoEncode : escapeText;
@@ -2168,33 +2169,33 @@ function parseInline(text, refs, plain) {
   const delims = [];
   const brackets = [];
   const autoLinks = [];
-  // Positions of every ']' encountered (for the link-text balance check:
-  // a link/image only forms when its text has equal '[' and ']' counts).
+  // Every ']' position (link-text balance: a link/image only forms when
+  // its text has equal '[' and ']' counts).
   const closes = [];
-  // Positions of backtick runs with no matching closer (an unclosed
-  // backtick inside link text blocks the link from forming).
+  // Backtick runs with no matching closer (an unclosed backtick inside
+  // link text blocks the link from forming).
   const unclosedTicks = [];
-  // [start, end] of every closed code span (for the link-text backtick
-  // parity exception: an odd run count is allowed when the link text
-  // ends with a closed code span).
+  // [start, end] of every closed code span (link-text backtick parity
+  // exception: an odd run count is allowed when the link text ends with
+  // a closed code span).
   const codeSpans = [];
   // Chunk indices of <del> elements whose content ends with a blocking
-  // strong pair (a ** pair whose opener is preceded by a space and
-  // whose closer is at the end of the del content, optionally followed
-  // by letters). Such a del blocks an enclosing * em match.
+  // strong pair (a ** pair whose opener is preceded by a space and whose
+  // closer is at the end of the del content, optionally followed by
+  // letters). Such a del blocks an enclosing * em match.
   const blockingDels = [];
   // Chunk indices of <del> elements whose content ends with a * em
   // (closer at the end, optionally followed by letters). Such a del
   // blocks an enclosing ** strong match.
   const blockingDelsStrong = [];
-  // Extended autolinks formed inside each del's recursive parse, by
-  // the chunk index of the del's inner HTML chunk: [{chunk, ext}].
-  // When a link forms around the del, these are reverted to text.
+  // Extended autolinks formed inside each del's recursive parse, keyed
+  // by the chunk index of the del's inner HTML chunk: [{chunk, ext}].
+  // When a link forms around the del, these revert to text.
   const delExtAutolinks = [];
   // Marked quirk: after a link whose text contains an unclosed backtick
-  // run, emphasis delimiters are suppressed while a backtick remains
-  // later in the text (not just until the next backtick run: a later
-  // backtick keeps the suppression active).
+  // run, emphasis delimiters stay suppressed while any backtick remains
+  // later in the text — not just until the next backtick run: a later
+  // backtick keeps the suppression active.
   let suppressEmUntilTick = false;
   const lastBacktick = text.lastIndexOf('`');
   let scopeCounter = 0;
@@ -2210,40 +2211,41 @@ function parseInline(text, refs, plain) {
       pushChunk(esc(text.slice(textStart, upto)), textStart);
     }
   }
+  // Rebuild a delimiter's chunk from its current tags and leftover
+  // literal length. Normally the close tags come first ("**a***" ->
+  // "<strong>a</strong>*"); when a recorded em span lies between this
+  // closer's opener and the closer, the leftover literals render inside
+  // the element ("**a *b*c***" -> "<strong>a <em>b</em>c*</strong>").
   function rebuildDelim(d) {
-    // Normally close tags come first ("**a***" -> "<strong>a</strong>*").
-    // But when a recorded em span lies between this closer's opener and
-    // the closer, the leftover literals render inside the element
-    // ("**a *b*c***" -> "<strong>a <em>b</em>c*</strong>").
-    if (d.leftoverInside) {
-      chunks[d.chunk] =
-        d.ch.repeat(d.len) + d.closeTags.join('') + d.openTags.join('');
-    } else {
-      chunks[d.chunk] =
-        d.closeTags.join('') + d.ch.repeat(d.len) + d.openTags.join('');
-    }
+    const lit = d.ch.repeat(d.len);
+    const close = d.closeTags.join('');
+    const open = d.openTags.join('');
+    chunks[d.chunk] = d.leftoverInside
+      ? lit + close + open
+      : close + lit + open;
   }
 
   while (i < n) {
     const c = text[i];
-    // Backslash escapes.
+    // Backslash escapes: \<newline> is a hard break (spaces/tabs after
+    // the newline are skipped too); \<punct> is the literal punctuation.
+    // Any other backslash is literal text.
     if (c === '\\') {
-      if (i + 1 < n && text[i + 1] === '\n') {
+      const next = i + 1 < n ? text[i + 1] : '';
+      if (next === '\n') {
         flushText(i);
         if (!plain) pushChunk('<br>', i);
         i += 2;
         while (i < n && isSpaceOrTab(text[i])) i++;
         textStart = i;
-        continue;
-      }
-      if (i + 1 < n && isAsciiPunct(text[i + 1])) {
+      } else if (isAsciiPunct(next)) {
         flushText(i);
-        pushChunk(esc(text[i + 1]), i);
+        pushChunk(esc(next), i);
         i += 2;
         textStart = i;
-        continue;
+      } else {
+        i++;
       }
-      i++;
       continue;
     }
     // Code spans.
