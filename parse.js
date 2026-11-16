@@ -982,12 +982,15 @@ function consumeParagraph(lines, i, refs, inListItem) {
   let endKind = 'blank';
   let setextLevel = 0;
   let tableAlign = null;
+  // Whether the previous continuation line was stripped (4+ leading
+  // columns removed by the list-item rule below).
+  let prevStripped = false;
   while (j < lines.length) {
     const L = lines[j];
     const t = L.t;
     if (isBlankLine(L)) { endKind = 'blank'; break; }
     // Lazy lines never interrupt a paragraph or form setext/table.
-    if (L.lazy) { paraLines.push(t); j++; continue; }
+    if (L.lazy) { paraLines.push(t); prevStripped = false; j++; continue; }
     const headerCells = splitTableRow(paraLines[paraLines.length - 1]);
     // A lazy delimiter line in a blockquote never forms a table, and a
     // lazy setext-like line never becomes a setext underline.
@@ -998,15 +1001,20 @@ function consumeParagraph(lines, i, refs, inListItem) {
     if (interruptsParagraph(t, inListItem)) { endKind = 'interrupt'; break; }
     // Marked quirk: inside a list item, a paragraph continuation line
     // with 4+ columns of leading whitespace loses 4 columns (top-level
-    // paragraphs keep their leading whitespace as-is).
+    // paragraphs keep their leading whitespace as-is). A non-stripped
+    // continuation line following a stripped one is preceded by a
+    // blank line inside the paragraph.
     if (inListItem) {
       const [w] = leadingWs(t);
       if (w >= 4) {
         paraLines.push(stripIndent(t, 4));
+        prevStripped = true;
         j++;
         continue;
       }
+      if (prevStripped) paraLines.push('');
     }
+    prevStripped = false;
     paraLines.push(t);
     j++;
   }
