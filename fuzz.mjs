@@ -1,13 +1,13 @@
 // fuzz.mjs — seeded differential + determinism fuzzer for parse.js.
 //
-// Generates random Markdown documents from a seeded PRNG and checks two
-// invariants that must hold for EVERY input:
+// Random Markdown documents come from a seeded PRNG, and two invariants
+// must hold for EVERY input:
 //   1. parse() never throws and always returns a string;
-//   2. parse() is deterministic: rendering the same input twice gives the
-//      same output (the parser keeps module-level inline state, so this
-//      catches state leaking between calls).
+//   2. parse() is deterministic: rendering the same input twice gives
+//      the same output (the parser keeps module-level inline state, so
+//      this catches state leaking between calls).
 //
-// Two generation modes cover different shapes of input. Soup mode mixes
+// Two generation modes cover different input shapes. Soup mode mixes
 // random lines from fragment pools (words, inline markup, block
 // constructs, stray punctuation). Nested mode grows deeply nested
 // constructs — quotes inside quotes, lists inside quotes, emphasis
@@ -40,26 +40,30 @@ import { parse } from './parse.js';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const KIT_DIR = process.env.MAKEFUN_KIT_DIR ??
-  join(HERE, '..', 'markdown-render-speed-02-kit');
+const ENTRY_DIR = dirname(fileURLToPath(import.meta.url));
+const KIT_ROOT = process.env.MAKEFUN_KIT_DIR ??
+  join(ENTRY_DIR, '..', 'markdown-render-speed-02-kit');
+
+const USAGE_TEXT =
+  'usage: node fuzz.mjs [--seed N] [--count N] [--max-lines N] [--compare N] ' +
+  '[--show N] [--mode soup|nested] [--max-depth N] [--marked PATH]';
 
 // ---------------------------------------------------------------------------
 // Seeded PRNG: sfc32, seeded from one 32-bit integer.
 // ---------------------------------------------------------------------------
 
 // Fold an arbitrary seed string into a 32-bit integer (FNV-1a).
-function fnv1a(text) {
+function hashSeed(text) {
   let hash = 0x811c9dc5;
-  for (let k = 0; k < text.length; k++) {
-    hash ^= text.charCodeAt(k);
+  for (let pos = 0; pos < text.length; pos++) {
+    hash ^= text.charCodeAt(pos);
     hash = Math.imul(hash, 0x01000193);
   }
   return hash >>> 0;
 }
 
 // One step of splitmix32: spreads a single seed into uncorrelated words.
-function splitmix32(state) {
+function spreadSeed(state) {
   let z = (state + 0x9e3779b9) | 0;
   z = Math.imul(z ^ (z >>> 16), 0x21f0aaad);
   z = Math.imul(z ^ (z >>> 15), 0x735a2d97);
@@ -69,11 +73,11 @@ function splitmix32(state) {
 // sfc32 ("small fast chaotic"): four words of state, one counter. Small,
 // fast, and deterministic for a fixed seed — the same seed reproduces
 // the same document stream on every run and every machine.
-function makePrng(seed) {
-  let a = splitmix32(seed);
-  let b = splitmix32(a);
-  let c = splitmix32(b);
-  let d = splitmix32(c);
+function createRng(seed) {
+  let a = spreadSeed(seed);
+  let b = spreadSeed(a);
+  let c = spreadSeed(b);
+  let d = spreadSeed(c);
   let counter = 1;
   return function next() {
     const t = (a + b + counter++) | 0;
@@ -90,7 +94,7 @@ function makePrng(seed) {
 // Fragment pools, grouped by the role each fragment plays.
 // ---------------------------------------------------------------------------
 
-const FRAGMENTS = {
+const POOLS = {
   words: [
     'alpha', 'beta', 'gamma', 'delta', 'word', 'text', 'hello', 'world',
     'foo', 'bar', 'baz', 'qux', 'lorem', 'ipsum', 'one', 'two', 'three',
@@ -135,36 +139,44 @@ const FRAGMENTS = {
 // ---------------------------------------------------------------------------
 
 // Draw one element of `pool` with the PRNG.
-function draw(rng, pool) {
+function pick(rng, pool) {
   return pool[Math.floor(rng() * pool.length)];
+}
+
+// Pick a bit class by its probability band: words 45%, inline 40%,
+// punctuation 15%.
+function pickBit(rng) {
+  const roll = rng();
+  if (roll < 0.45) return pick(rng, POOLS.words);
+  if (roll < 0.85) return pick(rng, POOLS.inline);
+  return pick(rng, POOLS.punct);
 }
 
 // A random inline soup line: words, inline bits and stray punctuation,
 // joined with spaces (sometimes with odd spacing or tabs).
-function soupLine(rng, maxBits) {
+function randomSoupLine(rng, maxBits) {
   const bitCount = 1 + Math.floor(rng() * maxBits);
   const bits = [];
-  for (let k = 0; k < bitCount; k++) {
-    const roll = rng();
-    if (roll < 0.45) bits.push(draw(rng, FRAGMENTS.words));
-    else if (roll < 0.85) bits.push(draw(rng, FRAGMENTS.inline));
-    else bits.push(draw(rng, FRAGMENTS.punct));
-  }
+  for (let k = 0; k < bitCount; k++) bits.push(pickBit(rng));
   const joiner = rng() < 0.1 ? '\t' : rng() < 0.15 ? '  ' : ' ';
   return bits.join(joiner);
 }
 
+// One line of a soup document: a block line, an inline soup line, or a
+// word plus an inline fragment.
+function soupDocLine(rng) {
+  const roll = rng();
+  if (roll < 0.5) return pick(rng, POOLS.blocks);
+  if (roll < 0.85) return randomSoupLine(rng, 6);
+  return pick(rng, POOLS.words) + ' ' + pick(rng, POOLS.inline);
+}
+
 // A random soup document: block lines, inline soup lines, and sometimes
 // a deliberately unterminated final line or extra blank lines.
-function soupDocument(rng, maxLines) {
+function randomSoupDoc(rng, maxLines) {
   const lineCount = 1 + Math.floor(rng() * maxLines);
   const lines = [];
-  for (let k = 0; k < lineCount; k++) {
-    const roll = rng();
-    if (roll < 0.5) lines.push(draw(rng, FRAGMENTS.blocks));
-    else if (roll < 0.85) lines.push(soupLine(rng, 6));
-    else lines.push(draw(rng, FRAGMENTS.words) + ' ' + draw(rng, FRAGMENTS.inline));
-  }
+  for (let k = 0; k < lineCount; k++) lines.push(soupDocLine(rng));
   let doc = lines.join('\n');
   if (rng() < 0.3) doc += '\n';
   if (rng() < 0.2) doc += '\n\n';
@@ -175,11 +187,11 @@ function soupDocument(rng, maxLines) {
 // depth 0), and the matching closer when the opener has one. Delimiter
 // openers close with themselves; '[' closes with '](u)' or ']' at
 // random; block openers ('> ', '- ', '1. ') prefix a whole line.
-function nestedConstruct(rng, depth) {
-  const opener = draw(rng, FRAGMENTS.nestOpen);
+function nestedPiece(rng, depth) {
+  const opener = pick(rng, POOLS.nestOpen);
   const core = depth <= 0
-    ? draw(rng, FRAGMENTS.nestWord)
-    : nestedConstruct(rng, depth - 1);
+    ? pick(rng, POOLS.nestWord)
+    : nestedPiece(rng, depth - 1);
   if (opener === '> ' || opener === '- ' || opener === '1. ') {
     return opener + core;
   }
@@ -193,51 +205,52 @@ function nestedConstruct(rng, depth) {
 
 // A nested document: several lines, each a nested construct at a random
 // depth up to maxDepth, sometimes joined into one paragraph.
-function nestedDocument(rng, maxDepth) {
+function randomNestedDoc(rng, maxDepth) {
   const lineCount = 1 + Math.floor(rng() * 6);
   const lines = [];
   for (let k = 0; k < lineCount; k++) {
     const depth = Math.floor(rng() * (maxDepth + 1));
-    lines.push(nestedConstruct(rng, depth));
+    lines.push(nestedPiece(rng, depth));
   }
   return lines.join(rng() < 0.5 ? '\n' : '\n\n');
 }
 
 // Dispatch to the mode's generator.
-function makeDocument(rng, opts) {
-  if (opts.mode === 'nested') return nestedDocument(rng, opts.maxDepth);
-  return soupDocument(rng, opts.maxLines);
+function generateDoc(rng, opts) {
+  if (opts.mode === 'nested') return randomNestedDoc(rng, opts.maxDepth);
+  return randomSoupDoc(rng, opts.maxLines);
 }
 
 // ---------------------------------------------------------------------------
 // One document's checks
 // ---------------------------------------------------------------------------
 
+// Render `doc`, catching any throw. Returns {ok, value, error}.
+function safeParse(doc) {
+  try {
+    return { ok: true, value: parse(doc) };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
 // Render `doc` twice and compare against marked when asked. Returns a
 // result record: {ok, kind?, error?, mismatch?}.
-function checkOne(doc, renderMarked) {
-  let first;
-  try {
-    first = parse(doc);
-  } catch (err) {
-    return { ok: false, kind: 'crash', error: String(err) };
+function verifyDoc(doc, renderMarked) {
+  const first = safeParse(doc);
+  if (!first.ok) return { ok: false, kind: 'crash', error: first.error };
+  if (typeof first.value !== 'string') {
+    return { ok: false, kind: 'non-string', error: `returned ${typeof first.value}` };
   }
-  if (typeof first !== 'string') {
-    return { ok: false, kind: 'non-string', error: `returned ${typeof first}` };
-  }
-  let second;
-  try {
-    second = parse(doc);
-  } catch (err) {
-    return { ok: false, kind: 'crash-on-reparse', error: String(err) };
-  }
-  if (second !== first) {
+  const second = safeParse(doc);
+  if (!second.ok) return { ok: false, kind: 'crash-on-reparse', error: second.error };
+  if (second.value !== first.value) {
     return { ok: false, kind: 'nondeterministic', error: 'second render differs' };
   }
   if (renderMarked) {
     const theirs = renderMarked(doc);
-    if (theirs !== first) {
-      return { ok: true, mismatch: { mine: first, marked: theirs } };
+    if (theirs !== first.value) {
+      return { ok: true, mismatch: { mine: first.value, marked: theirs } };
     }
   }
   return { ok: true };
@@ -247,25 +260,31 @@ function checkOne(doc, renderMarked) {
 // CLI + run
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
+// Number-valued flags: their option key, fallback, and minimum.
+const NUMBER_FLAGS = {
+  '--count': { key: 'count', fallback: 500, min: 1 },
+  '--max-lines': { key: 'maxLines', fallback: 12, min: 1 },
+  '--compare': { key: 'compare', fallback: 0, min: 0 },
+  '--show': { key: 'show', fallback: 0, min: 0 },
+  '--max-depth': { key: 'maxDepth', fallback: 4, min: 0 },
+};
+
+function readOptions(argv) {
   const opts = {
     seed: '1', count: 500, maxLines: 12, compare: 0, show: 3,
     mode: 'soup', maxDepth: 4, marked: null,
   };
-  const readNumber = (k, fallback) => {
-    const raw = argv[k + 1];
-    if (raw === undefined) throw new Error(`missing value for ${argv[k]}`);
-    return Number(raw) || fallback;
-  };
   for (let k = 0; k < argv.length; k++) {
     const arg = argv[k];
+    const numeric = NUMBER_FLAGS[arg];
+    if (numeric !== undefined) {
+      const raw = argv[++k];
+      if (raw === undefined) throw new Error(`missing value for ${argv[k - 1]}`);
+      opts[numeric.key] = Math.max(numeric.min, Number(raw) || numeric.fallback);
+      continue;
+    }
     switch (arg) {
       case '--seed': opts.seed = argv[++k] ?? '1'; break;
-      case '--count': opts.count = Math.max(1, readNumber(k, 500)); k++; break;
-      case '--max-lines': opts.maxLines = Math.max(1, readNumber(k, 12)); k++; break;
-      case '--compare': opts.compare = Math.max(0, readNumber(k, 0)); k++; break;
-      case '--show': opts.show = Math.max(0, readNumber(k, 0)); k++; break;
-      case '--max-depth': opts.maxDepth = Math.max(0, readNumber(k, 4)); k++; break;
       case '--mode': {
         const mode = argv[++k];
         if (mode !== 'soup' && mode !== 'nested') {
@@ -277,7 +296,7 @@ function parseArgs(argv) {
       case '--marked': opts.marked = argv[++k] ?? null; break;
       case '--help':
       case '-h':
-        console.log('usage: node fuzz.mjs [--seed N] [--count N] [--max-lines N] [--compare N] [--show N] [--mode soup|nested] [--max-depth N] [--marked PATH]');
+        console.log(USAGE_TEXT);
         process.exit(0);
         break;
       default:
@@ -287,17 +306,25 @@ function parseArgs(argv) {
   return opts;
 }
 
+// Resolve a seed string to the 32-bit integer the PRNG takes.
+function seedToInt(seed) {
+  if (/^-?\d+$/.test(String(seed))) return Number(seed) >>> 0;
+  return hashSeed(String(seed));
+}
+
+// Load the vendored marked module's parse function.
+async function importMarked(path) {
+  const markedModule = await import(path);
+  return (doc) => markedModule.marked.parse(doc);
+}
+
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  const numericSeed = /^-?\d+$/.test(String(opts.seed))
-    ? Number(opts.seed) >>> 0
-    : fnv1a(String(opts.seed));
-  const rng = makePrng(numericSeed);
+  const opts = readOptions(process.argv.slice(2));
+  const rng = createRng(seedToInt(opts.seed));
   let renderMarked = null;
   if (opts.compare > 0) {
-    const markedPath = opts.marked ?? join(KIT_DIR, 'baselines', 'vendor', 'marked', 'marked.esm.js');
-    const markedModule = await import(markedPath);
-    renderMarked = (doc) => markedModule.marked.parse(doc);
+    const markedPath = opts.marked ?? join(KIT_ROOT, 'baselines', 'vendor', 'marked', 'marked.esm.js');
+    renderMarked = await importMarked(markedPath);
   }
 
   const stats = { crashes: 0, nonString: 0, nondeterministic: 0, mismatches: 0 };
@@ -305,9 +332,9 @@ async function main() {
   const mismatchSamples = [];
 
   for (let idx = 0; idx < opts.count; idx++) {
-    const doc = makeDocument(rng, opts);
+    const doc = generateDoc(rng, opts);
     const marked = renderMarked && idx < opts.compare ? renderMarked : null;
-    const result = checkOne(doc, marked);
+    const result = verifyDoc(doc, marked);
     if (!result.ok) {
       if (result.kind === 'crash' || result.kind === 'crash-on-reparse') stats.crashes++;
       else if (result.kind === 'non-string') stats.nonString++;

@@ -1,30 +1,31 @@
-// benchmark.mjs — correctness-first timing of parse.js against marked.
+// benchmark.mjs — time parse.js against the kit's vendored marked.
 //
-// Renders the kit's 720 practice cases with this entry's parse() and with
-// the kit's vendored marked 18.1.3, then compares wall-clock totals. The
-// correctness gate runs before any timing: a single byte difference voids
-// the whole run, because a fast wrong renderer is not a renderer.
+// The entry's renderer and marked 18.1.3 both render the kit's 720
+// practice cases; this tool reports how much faster the entry is. A
+// correctness gate runs first: if any case renders differently, the run
+// stops before timing anything, because a fast renderer that disagrees
+// with the baseline is not a renderer at all.
 //
-// Two timing styles are supported. Sequential (--runs) measures each engine
-// in its own block of passes; interleaved (--interleaved) alternates the
-// engines round by round, which cancels the slow drift of a shared,
-// contended machine — on such a box the interleaved min-vs-min speedup is
-// the number to trust, while sequential medians can swing by 2x between
-// runs. Both styles report min/median/mean/p95 and the five slowest cases.
+// Two measurement styles are available:
+//   * sequential (--runs): each engine runs its passes in one block;
+//   * interleaved (--interleaved): the engines alternate round by round,
+//     so a slow drift of a shared machine hits both sides near-equally.
+// On a contended box the interleaved min-vs-min speedup is the number to
+// trust; sequential medians can swing by 2x between runs.
 //
 // Usage (from the entry directory):
 //   node benchmark.mjs [--runs N] [--warmup N] [--interleaved N]
 //                      [--json] [--report FILE] [--cases PATH] [--marked PATH]
+//
 //   --runs N        sequential timed passes per engine (default 5)
 //   --warmup N      untimed warmup passes per engine (default 1)
-//   --interleaved N interleaved rounds instead of sequential passes
-//                   (each round times both engines once, back to back)
+//   --interleaved N interleaved rounds in place of sequential passes
 //   --json          print the report as JSON instead of prose
 //   --report F      also write the JSON report to file F
 //   --cases P       cases file (default: the kit's practice input)
 //   --marked P      vendored marked module (default: the kit's baseline)
 //
-// The kit directory comes from MAKEFUN_KIT_DIR when set, else
+// The kit directory comes from MAKEFUN_KIT_DIR when set, otherwise from
 // ../markdown-render-speed-02-kit relative to this file.
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -32,51 +33,101 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from './parse.js';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const KIT_DIR = process.env.MAKEFUN_KIT_DIR ??
-  join(HERE, '..', 'markdown-render-speed-02-kit');
+const ENTRY_DIR = dirname(fileURLToPath(import.meta.url));
+const KIT_ROOT = process.env.MAKEFUN_KIT_DIR ??
+  join(ENTRY_DIR, '..', 'markdown-render-speed-02-kit');
 
-const USAGE =
+const USAGE_TEXT =
   'usage: node benchmark.mjs [--runs N] [--warmup N] [--interleaved N] ' +
   '[--json] [--report FILE] [--cases PATH] [--marked PATH]';
+
+// ---------------------------------------------------------------------------
+// Timing statistics: every summary reads from one ascending order.
+// ---------------------------------------------------------------------------
+
+// Round to two decimals for display. Raw samples stay unrounded upstream.
+function roundHundredths(value) {
+  return Math.round(value * 100) / 100;
+}
+
+// A sorted copy of the sample, ascending.
+function ascending(values) {
+  return values.slice().sort((left, right) => left - right);
+}
+
+// Median of an already-sorted sample.
+function medianOf(ordered) {
+  const count = ordered.length;
+  const middle = Math.floor(count / 2);
+  if (count % 2 === 1) return ordered[middle];
+  return (ordered[middle - 1] + ordered[middle]) / 2;
+}
+
+// The p-th percentile of an already-sorted sample, nearest-rank rule.
+function nearestRank(ordered, p) {
+  const rank = Math.max(1, Math.ceil((p / 100) * ordered.length));
+  return ordered[rank - 1];
+}
+
+// Full summary of a timing sample: count, min, max, mean, median, p95,
+// standard deviation, and the rounded samples themselves.
+function summarizeSamples(samples) {
+  const ordered = ascending(samples);
+  const count = ordered.length;
+  const total = samples.reduce((sum, t) => sum + t, 0);
+  const mean = total / count;
+  const spread = samples.reduce((sum, t) => sum + (t - mean) ** 2, 0) / count;
+  return {
+    runs: count,
+    minMs: roundHundredths(ordered[0]),
+    maxMs: roundHundredths(ordered[count - 1]),
+    meanMs: roundHundredths(mean),
+    medianMs: roundHundredths(medianOf(ordered)),
+    p95Ms: roundHundredths(nearestRank(ordered, 95)),
+    stddevMs: roundHundredths(Math.sqrt(spread)),
+    samplesMs: samples.map(roundHundredths),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // CLI parsing: a small flag table drives the whole parser.
 // ---------------------------------------------------------------------------
 
-// Each flag maps to its option key, whether it takes a value, and how to
-// coerce that value (number flags fall back to their default on garbage).
-const FLAG_TABLE = {
-  '--runs': { key: 'runs', value: true, num: true, fallback: 5 },
-  '--warmup': { key: 'warmup', value: true, num: true, fallback: 1 },
-  '--interleaved': { key: 'interleaved', value: true, num: true, fallback: 0 },
-  '--report': { key: 'report', value: true, num: false },
-  '--cases': { key: 'cases', value: true, num: false },
-  '--marked': { key: 'marked', value: true, num: false },
-  '--json': { key: 'json', value: false },
-  '--help': { key: 'help', value: false },
-  '-h': { key: 'help', value: false },
+// Each flag maps to its option key, whether it takes a value, whether the
+// value is numeric, and the fallback a numeric flag uses on garbage.
+const CLI_FLAGS = {
+  '--runs': { key: 'runs', takesValue: true, numeric: true, fallback: 5 },
+  '--warmup': { key: 'warmup', takesValue: true, numeric: true, fallback: 1 },
+  '--interleaved': { key: 'interleaved', takesValue: true, numeric: true, fallback: 0 },
+  '--report': { key: 'report', takesValue: true, numeric: false },
+  '--cases': { key: 'cases', takesValue: true, numeric: false },
+  '--marked': { key: 'marked', takesValue: true, numeric: false },
+  '--json': { key: 'json', takesValue: false },
+  '--help': { key: 'help', takesValue: false },
+  '-h': { key: 'help', takesValue: false },
 };
 
-function parseArgs(argv) {
+function readOptions(argv) {
   const opts = {
     runs: 5, warmup: 1, interleaved: 0,
     json: false, report: null, cases: null, marked: null,
   };
-  for (let k = 0; k < argv.length; k++) {
-    const spec = FLAG_TABLE[argv[k]];
-    if (spec === undefined) throw new Error(`unknown argument: ${argv[k]} (see --help)`);
+  for (let pos = 0; pos < argv.length; pos++) {
+    const spec = CLI_FLAGS[argv[pos]];
+    if (spec === undefined) {
+      throw new Error(`unknown argument: ${argv[pos]} (see --help)`);
+    }
     if (spec.key === 'help') {
-      console.log(USAGE);
+      console.log(USAGE_TEXT);
       process.exit(0);
     }
-    if (!spec.value) {
+    if (!spec.takesValue) {
       opts[spec.key] = true;
       continue;
     }
-    const raw = argv[++k];
-    if (raw === undefined) throw new Error(`missing value for ${argv[k - 1]}`);
-    opts[spec.key] = spec.num
+    const raw = argv[++pos];
+    if (raw === undefined) throw new Error(`missing value for ${argv[pos - 1]}`);
+    opts[spec.key] = spec.numeric
       ? Math.max(0, Number(raw) || spec.fallback)
       : raw;
   }
@@ -89,7 +140,7 @@ function parseArgs(argv) {
 // ---------------------------------------------------------------------------
 
 // Load a JSON document, failing with a message that names the file.
-function loadJson(path) {
+function readJsonFile(path) {
   let raw;
   try {
     raw = readFileSync(path, 'utf8');
@@ -100,7 +151,7 @@ function loadJson(path) {
 }
 
 // Dynamically import the marked module and return its parse function.
-async function loadMarked(path) {
+async function importMarked(path) {
   const mod = await import(path);
   const fn = mod.marked?.parse ?? mod.parse ?? mod.default;
   if (typeof fn !== 'function') throw new Error(`no parse function in ${path}`);
@@ -108,54 +159,11 @@ async function loadMarked(path) {
 }
 
 // ---------------------------------------------------------------------------
-// Statistics over a sample of millisecond timings.
-// ---------------------------------------------------------------------------
-
-// Sorted copy, ascending — every summary below reads from this one order.
-function sortedCopy(values) {
-  return values.slice().sort((a, b) => a - b);
-}
-
-// The p-th percentile by the nearest-rank rule.
-function percentile(ordered, p) {
-  const rank = Math.max(1, Math.ceil((p / 100) * ordered.length));
-  return ordered[rank - 1];
-}
-
-// Round to two decimals for display; raw samples stay unrounded upstream.
-function round2(x) {
-  return Math.round(x * 100) / 100;
-}
-
-// Full summary of a timing sample: count, min, max, mean, median, p95,
-// standard deviation, and the rounded samples themselves.
-function summarize(samples) {
-  const ordered = sortedCopy(samples);
-  const count = ordered.length;
-  const mid = Math.floor(count / 2);
-  const median = count % 2 === 1
-    ? ordered[mid]
-    : (ordered[mid - 1] + ordered[mid]) / 2;
-  const mean = samples.reduce((sum, t) => sum + t, 0) / count;
-  const variance = samples.reduce((sum, t) => sum + (t - mean) ** 2, 0) / count;
-  return {
-    runs: count,
-    minMs: round2(ordered[0]),
-    maxMs: round2(ordered[count - 1]),
-    meanMs: round2(mean),
-    medianMs: round2(median),
-    p95Ms: round2(percentile(ordered, 95)),
-    stddevMs: round2(Math.sqrt(variance)),
-    samplesMs: samples.map(round2),
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Timing primitives
 // ---------------------------------------------------------------------------
 
 // Wall-clock milliseconds for one full pass of `render` over `docs`.
-function timePass(docs, render) {
+function timeOnePass(docs, render) {
   const started = process.hrtime.bigint();
   for (const doc of docs) render(doc);
   const finished = process.hrtime.bigint();
@@ -163,21 +171,21 @@ function timePass(docs, render) {
 }
 
 // `reps` sequential passes; returns the list of per-pass timings.
-function timeSequential(docs, render, reps) {
+function runSequential(docs, render, reps) {
   const samples = [];
-  for (let rep = 0; rep < reps; rep++) samples.push(timePass(docs, render));
+  for (let rep = 0; rep < reps; rep++) samples.push(timeOnePass(docs, render));
   return samples;
 }
 
 // `rounds` interleaved rounds: each round times both engines once, mine
 // first, so a slow drift of the machine hits both sides near-equally.
 // Returns {mine, marked} sample lists.
-function timeInterleaved(docs, mine, marked, rounds) {
+function runInterleaved(docs, mine, marked, rounds) {
   const mineSamples = [];
   const markedSamples = [];
   for (let round = 0; round < rounds; round++) {
-    mineSamples.push(timePass(docs, mine));
-    markedSamples.push(timePass(docs, marked));
+    mineSamples.push(timeOnePass(docs, mine));
+    markedSamples.push(timeOnePass(docs, marked));
   }
   return { mine: mineSamples, marked: markedSamples };
 }
@@ -187,7 +195,7 @@ function timeInterleaved(docs, mine, marked, rounds) {
 // ---------------------------------------------------------------------------
 
 // Ids of every case whose two renderings differ (empty = identical).
-function collectMismatches(docs, ids, mine, marked) {
+function findMismatches(docs, ids, mine, marked) {
   const bad = [];
   for (let idx = 0; idx < docs.length; idx++) {
     if (mine(docs[idx]) !== marked(docs[idx])) bad.push(ids[idx]);
@@ -196,7 +204,7 @@ function collectMismatches(docs, ids, mine, marked) {
 }
 
 // The `count` slowest individual documents for `render`, slowest first.
-function slowestCases(docs, ids, render, count) {
+function slowestDocs(docs, ids, render, count) {
   const scored = docs.map((doc, idx) => {
     const started = process.hrtime.bigint();
     render(doc);
@@ -204,32 +212,32 @@ function slowestCases(docs, ids, render, count) {
     return { id: ids[idx], ms: Number(finished - started) / 1e6 };
   });
   scored.sort((a, b) => b.ms - a.ms);
-  return scored.slice(0, count).map((s) => ({ id: s.id, ms: round2(s.ms) }));
+  return scored.slice(0, count).map((s) => ({ id: s.id, ms: roundHundredths(s.ms) }));
 }
 
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
+// One engine's summary line for the prose report.
+function engineLine(tag, summary, mode) {
+  const passes = summary.runs === 1 ? 'pass' : 'passes';
+  return (
+    `${tag} : median ${summary.medianMs} ms (min ${summary.minMs}, ` +
+    `max ${summary.maxMs}, p95 ${summary.p95Ms}, mean ${summary.meanMs}) ` +
+    `over ${summary.runs} ${mode} ${passes}`
+  );
+}
+
 // Human-readable report lines for a completed run.
-function formatReport(report) {
+function renderReport(report) {
   const lines = [];
   lines.push(
     `cases: ${report.cases} (${report.totalInputBytes} input bytes), ` +
     'all byte-identical to marked',
   );
-  const mine = report.mine;
-  const marked = report.marked;
-  lines.push(
-    `mine   : median ${mine.medianMs} ms (min ${mine.minMs}, ` +
-    `max ${mine.maxMs}, p95 ${mine.p95Ms}, mean ${mine.meanMs}) ` +
-    `over ${mine.runs} ${report.mode} ${mine.runs === 1 ? 'pass' : 'passes'}`,
-  );
-  lines.push(
-    `marked : median ${marked.medianMs} ms (min ${marked.minMs}, ` +
-    `max ${marked.maxMs}, p95 ${marked.p95Ms}, mean ${marked.meanMs}) ` +
-    `over ${marked.runs} ${report.mode} ${marked.runs === 1 ? 'pass' : 'passes'}`,
-  );
+  lines.push(engineLine('mine  ', report.mine, report.mode));
+  lines.push(engineLine('marked', report.marked, report.mode));
   lines.push(`speedup: ${report.speedupMedian}x (median vs median)`);
   if (report.speedupMin !== undefined) {
     lines.push(`speedup: ${report.speedupMin}x (min vs min)`);
@@ -241,26 +249,31 @@ function formatReport(report) {
   return lines.join('\n');
 }
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  const casesPath = opts.cases ?? join(KIT_DIR, 'practice', 'input', 'cases.json');
-  const markedPath = opts.marked ?? join(KIT_DIR, 'baselines', 'vendor', 'marked', 'marked.esm.js');
-  const cases = loadJson(casesPath);
+// The JSON object printed (or written) when the gate fails.
+function failureReport(docCount, badIds) {
+  return {
+    ok: false,
+    cases: docCount,
+    mismatches: badIds.length,
+    mismatchIds: badIds.slice(0, 20),
+  };
+}
+
+async function run() {
+  const opts = readOptions(process.argv.slice(2));
+  const casesPath = opts.cases ?? join(KIT_ROOT, 'practice', 'input', 'cases.json');
+  const markedPath = opts.marked ?? join(KIT_ROOT, 'baselines', 'vendor', 'marked', 'marked.esm.js');
+  const cases = readJsonFile(casesPath);
   const docs = cases.map((entry) => entry.markdown);
   const ids = cases.map((entry) => entry.id);
-  const renderMarked = await loadMarked(markedPath);
+  const renderMarked = await importMarked(markedPath);
 
   // Gate: byte-identical output on every case, or the timing is void.
-  const bad = collectMismatches(docs, ids, parse, renderMarked);
+  const bad = findMismatches(docs, ids, parse, renderMarked);
   if (bad.length > 0) {
-    const failure = {
-      ok: false,
-      cases: docs.length,
-      mismatches: bad.length,
-      mismatchIds: bad.slice(0, 20),
-    };
-    if (opts.json) console.log(JSON.stringify(failure, null, 2));
-    else {
+    if (opts.json) {
+      console.log(JSON.stringify(failureReport(docs.length, bad), null, 2));
+    } else {
       console.log(`CORRECTNESS FAIL: ${bad.length}/${docs.length} cases differ from marked`);
       console.log('first mismatches:', bad.slice(0, 20).join(', '));
     }
@@ -270,25 +283,25 @@ async function main() {
 
   // Warmup (JIT + caches) before any timed pass.
   for (let w = 0; w < opts.warmup; w++) {
-    timePass(docs, parse);
-    timePass(docs, renderMarked);
+    timeOnePass(docs, parse);
+    timeOnePass(docs, renderMarked);
   }
 
   let mineSamples;
   let markedSamples;
   let mode;
   if (opts.interleaved > 0) {
-    const both = timeInterleaved(docs, parse, renderMarked, opts.interleaved);
+    const both = runInterleaved(docs, parse, renderMarked, opts.interleaved);
     mineSamples = both.mine;
     markedSamples = both.marked;
     mode = 'interleaved';
   } else {
-    mineSamples = timeSequential(docs, parse, opts.runs);
-    markedSamples = timeSequential(docs, renderMarked, opts.runs);
+    mineSamples = runSequential(docs, parse, opts.runs);
+    markedSamples = runSequential(docs, renderMarked, opts.runs);
     mode = 'sequential';
   }
-  const mineSummary = summarize(mineSamples);
-  const markedSummary = summarize(markedSamples);
+  const mineSummary = summarizeSamples(mineSamples);
+  const markedSummary = summarizeSamples(markedSamples);
   const totalInputBytes = docs.reduce((sum, doc) => sum + Buffer.byteLength(doc, 'utf8'), 0);
 
   const report = {
@@ -298,12 +311,12 @@ async function main() {
     totalInputBytes,
     mine: mineSummary,
     marked: markedSummary,
-    speedupMedian: round2(markedSummary.medianMs / mineSummary.medianMs),
-    slowestMineMs: slowestCases(docs, ids, parse, 5),
+    speedupMedian: roundHundredths(markedSummary.medianMs / mineSummary.medianMs),
+    slowestMineMs: slowestDocs(docs, ids, parse, 5),
     node: process.version,
   };
   if (mode === 'interleaved') {
-    report.speedupMin = round2(markedSummary.minMs / mineSummary.minMs);
+    report.speedupMin = roundHundredths(markedSummary.minMs / mineSummary.minMs);
   }
 
   if (opts.report) writeFileSync(opts.report, JSON.stringify(report, null, 2) + '\n', 'utf8');
@@ -311,10 +324,10 @@ async function main() {
     console.log(JSON.stringify(report, null, 2));
     return;
   }
-  console.log(formatReport(report));
+  console.log(renderReport(report));
 }
 
-main().catch((err) => {
+run().catch((err) => {
   console.error('benchmark failed:', err.message);
   process.exitCode = 1;
 });
