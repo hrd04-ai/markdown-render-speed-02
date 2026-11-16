@@ -935,8 +935,9 @@ function skipDefGap(text, i) {
 // Scan a link destination starting at text[i]. Angle form <...> (no
 // newlines, no '<' inside, escapes resolved) or bare form (balanced
 // parens, no spaces/control chars, escapes resolved). Returns
-// {dest, end} or null.
-function scanLinkDest(text, i) {
+// {dest, end} or null. A bare empty destination is invalid unless
+// allowEmpty is set (inline links allow [a]()).
+function scanLinkDest(text, i, allowEmpty) {
   const n = text.length;
   if (text[i] === '<') {
     let dest = '';
@@ -982,7 +983,7 @@ function scanLinkDest(text, i) {
     dest += c;
     i++;
   }
-  if (dest === '' || depth !== 0) return null;
+  if ((dest === '' && !allowEmpty) || depth !== 0) return null;
   return { dest, end: i };
 }
 
@@ -1579,6 +1580,53 @@ function parseBlocks(lines, refs, inListItem) {
 // Inline HTML and autolinks
 // ---------------------------------------------------------------------------
 
+// Skip tag whitespace (space, tab, newline) from j; return the new index.
+function skipTagWs(text, j) {
+  const n = text.length;
+  while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
+  return j;
+}
+
+// Scan one attribute starting at text[j] (first char of the name).
+// Returns the index just past the attribute (or past the name for a
+// boolean attribute), or -1 when the attribute is malformed.
+function scanTagAttribute(text, j) {
+  const n = text.length;
+  if (!isAlpha(text[j]) && text[j] !== '_' && text[j] !== ':') return -1;
+  j++;
+  while (j < n) {
+    const c = text[j];
+    if (isAlpha(c) || isDigit(c) || c === '_' || c === '.' || c === ':' || c === '-') j++;
+    else break;
+  }
+  const afterName = j;
+  j = skipTagWs(text, j);
+  if (j < n && text[j] === '=') {
+    j++;
+    j = skipTagWs(text, j);
+    if (j >= n) return -1;
+    const q = text[j];
+    if (q === '"' || q === "'") {
+      j++;
+      while (j < n && text[j] !== q) j++;
+      if (j >= n) return -1;
+      return j + 1;
+    }
+    const vs = j;
+    while (j < n) {
+      const c = text[j];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '>' || c === '"' ||
+          c === "'" || c === '=' || c === '<' || c === '`') break;
+      j++;
+    }
+    if (j === vs) return -1;
+    return j;
+  }
+  // Boolean attribute (no '='): the whitespace after the name stays for
+  // the next iteration's separator check.
+  return afterName;
+}
+
 // Match an inline HTML tag starting at text[i] ('<'). Returns the index just
 // past the tag, or -1. Covers open/close tags (attributes need preceding
 // whitespace; closing tags take no attributes).
@@ -1586,56 +1634,30 @@ function matchInlineTag(text, i) {
   const n = text.length;
   let j = i + 1;
   let closing = false;
-  if (j < n && text[j] === '/') { closing = true; j++; }
+  if (j < n && text[j] === '/') {
+    closing = true;
+    j++;
+  }
   if (j >= n || !isAlpha(text[j])) return -1;
   j++;
   while (j < n && (isAlpha(text[j]) || isDigit(text[j]) || text[j] === '-')) j++;
   for (;;) {
-    let hadWs = false;
-    while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) {
-      hadWs = true;
-      j++;
-    }
+    const wsEnd = skipTagWs(text, j);
+    const hadWs = wsEnd > j;
+    j = wsEnd;
     if (j >= n) return -1;
     if (text[j] === '>') return j + 1;
     if (text[j] === '/' && !closing && j + 1 < n && text[j + 1] === '>') return j + 2;
     if (closing || !hadWs) return -1;
-    // Attribute name.
-    if (!isAlpha(text[j]) && text[j] !== '_' && text[j] !== ':') return -1;
-    j++;
-    while (j < n) {
-      const c = text[j];
-      if (isAlpha(c) || isDigit(c) || c === '_' || c === '.' || c === ':' || c === '-') j++;
-      else break;
-    }
-    const afterName = j;
-    while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
-    if (j < n && text[j] === '=') {
-      j++;
-      while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
-      if (j >= n) return -1;
-      const q = text[j];
-      if (q === '"' || q === "'") {
-        j++;
-        while (j < n && text[j] !== q) j++;
-        if (j >= n) return -1;
-        j++;
-      } else {
-        const vs = j;
-        while (j < n) {
-          const c = text[j];
-          if (c === ' ' || c === '\t' || c === '\n' || c === '>' || c === '"' ||
-              c === "'" || c === '=' || c === '<' || c === '`') break;
-          j++;
-        }
-        if (j === vs) return -1;
-      }
-    } else {
-      // Boolean attribute (no '='): restore j so the whitespace stays
-      // for the next iteration's separator check.
-      j = afterName;
-    }
+    j = scanTagAttribute(text, j);
+    if (j === -1) return -1;
   }
+}
+
+// Find `needle` in text from `from`; return the index just past it, or -1.
+function findTerminator(text, needle, from) {
+  const e = text.indexOf(needle, from);
+  return e === -1 ? -1 : e + needle.length;
 }
 
 // Match inline raw HTML starting at text[i] ('<'): comment, PI, declaration,
@@ -1645,16 +1667,13 @@ function matchInlineHtml(text, i) {
   if (text.startsWith('<!--', i)) {
     if (text.startsWith('<!-->', i)) return i + 5;
     if (text.startsWith('<!--->', i)) return i + 6;
-    const e = text.indexOf('-->', i + 4);
-    return e === -1 ? -1 : e + 3;
+    return findTerminator(text, '-->', i + 4);
   }
   if (text.startsWith('<?', i)) {
-    const e = text.indexOf('?>', i + 2);
-    return e === -1 ? -1 : e + 2;
+    return findTerminator(text, '?>', i + 2);
   }
   if (text.startsWith('<![CDATA[', i)) {
-    const e = text.indexOf(']]>', i + 9);
-    return e === -1 ? -1 : e + 3;
+    return findTerminator(text, ']]>', i + 9);
   }
   if (i + 2 < n && text[i + 1] === '!') {
     // Declaration: <! + letters + whitespace + ... + '>'.
@@ -1662,9 +1681,8 @@ function matchInlineHtml(text, i) {
     const ls = j;
     while (j < n && isAlpha(text[j])) j++;
     if (j === ls) return -1;
-    if (j >= n || !isSpaceOrTab(text[j]) && text[j] !== '\n') return -1;
-    const e = text.indexOf('>', j);
-    return e === -1 ? -1 : e + 1;
+    if (j >= n || (!isSpaceOrTab(text[j]) && text[j] !== '\n')) return -1;
+    return findTerminator(text, '>', j);
   }
   return matchInlineTag(text, i);
 }
@@ -1673,14 +1691,14 @@ function matchInlineHtml(text, i) {
 // state that suppresses extended autolinks (www/http/email) in the rest
 // of the document until a </a> close tag clears it. The state persists
 // across blocks (paragraphs, headings, lists, blockquotes). The trigger
-// is narrow: the open tag must be "<a" + a literal SPACE (tab/newline/
-// '>'/'/' after the name do not set it; bare <a> and <a/> do not set
+// is narrow: the open tag must be "<a" + a literal SPACE (a tab, newline,
+// '>' or '/' after the name does not set it; bare <a> and <a/> do not set
 // it), and only the exact 4-char tag "</a>" (any case) clears it —
 // "</a >", "</a\t>" and "</a\n>" do not. Tags inside HTML blocks, code
 // spans, or link text do not affect the state (a link's text is parsed
 // in an isolated scope that restores the state when the link forms).
 let inLinkGlobal = false;
-// Count of markdown links formed during the current parse() call. Used
+// How many markdown links formed during the current parse() call. Used
 // to detect a link formed inside a strikethrough's recursive parse: a
 // bracket enclosing such a strikethrough can never form a link itself.
 let linksFormed = 0;
@@ -1690,6 +1708,19 @@ let linksFormed = 0;
 // a link (an https autolink's HTML is identical to an angle autolink's,
 // so only creation-time tracking can distinguish them).
 let extAutolinks = [];
+
+// Scan an email local part (the part before '@') starting at s:
+// [A-Za-z0-9._+-]+. Returns the end index.
+function scanEmailLocal(text, s) {
+  const n = text.length;
+  let j = s;
+  while (j < n) {
+    const c = text[j];
+    if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
+    else break;
+  }
+  return j;
+}
 
 // Validate an email domain (the part after '@'): labels of [A-Za-z0-9_-]+
 // separated by single dots, at least two labels. Returns the end index of
@@ -1707,14 +1738,17 @@ function matchEmailDomain(text, dStart, trimTrailingUnderscore) {
     else break;
   }
   let end = j;
+  // Trim trailing dots, and (when trimTrailingUnderscore is set) trailing
+  // underscores; repeat, because trimming '_' can expose more '.'s.
   for (;;) {
     while (end > dStart && text[end - 1] === '.') end--;
-    if (trimTrailingUnderscore) {
-      let trimmed = false;
-      while (end > dStart && text[end - 1] === '_') { end--; trimmed = true; }
-      if (trimmed) continue;
+    if (!trimTrailingUnderscore) break;
+    let trimmed = false;
+    while (end > dStart && text[end - 1] === '_') {
+      end--;
+      trimmed = true;
     }
-    break;
+    if (!trimmed) break;
   }
   if (end === dStart) return -1;
   const last = text[end - 1];
@@ -1732,8 +1766,8 @@ function matchEmailDomain(text, dStart, trimTrailingUnderscore) {
 function matchEmail(text, atPos, minStart, trimTrailingUnderscore) {
   // The local part must not scan before minStart (the current text run
   // start): a '_' emphasis delimiter before it is not part of the email.
-  let s = atPos - 1;
   const lo = minStart === undefined ? 0 : minStart;
+  let s = atPos - 1;
   while (s >= lo) {
     const c = text[s];
     if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') s--;
@@ -1776,26 +1810,29 @@ function matchAngleAutolink(text, i) {
     }
   }
   // Email in angles.
-  const em = matchEmailAt(text, i + 1);
-  if (em) return em;
-  return null;
+  return matchEmailAt(text, i + 1);
 }
 
 // Match <email> starting right after '<' (at position s). Returns the
 // autolink or null.
 function matchEmailAt(text, s) {
   const n = text.length;
-  let j = s;
-  while (j < n) {
-    const c = text[j];
-    if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
-    else break;
-  }
+  const j = scanEmailLocal(text, s);
   if (j === s || j >= n || text[j] !== '@') return null;
   const end = matchEmailDomain(text, j + 1);
   if (end === -1 || end >= n || text[end] !== '>') return null;
   const email = text.slice(s, end);
   return { href: 'mailto:' + email, text: email, end: end + 1 };
+}
+
+// If s ends with a named entity &\w+;, return the index of its '&'.
+// Otherwise -1.
+function trailingEntityAmp(s) {
+  if (!s.endsWith(';')) return -1;
+  let k = s.length - 2;
+  while (k >= 0 && isWordChar(s[k])) k--;
+  if (k >= 0 && s[k] === '&' && k < s.length - 2) return k;
+  return -1;
 }
 
 // Trim an extended-autolink candidate per marked's rules: paren groups,
@@ -1809,7 +1846,10 @@ function trimUrlCandidate(cand) {
   while (i < cand.length) {
     if (cand[i] === '(') {
       const close = cand.indexOf(')', i + 1);
-      if (close === -1) { cut = i; break; }
+      if (close === -1) {
+        cut = i;
+        break;
+      }
       closers.add(close);
       i = close + 1;
     } else i++;
@@ -1818,22 +1858,18 @@ function trimUrlCandidate(cand) {
   // Trailing trims, looped until stable.
   for (;;) {
     if (s === '') break;
-    // (a) trailing named entity &\w+;
-    if (s.endsWith(';')) {
-      let k = s.length - 2;
-      while (k >= 0 && isWordChar(s[k])) k--;
-      if (k >= 0 && s[k] === '&' && k < s.length - 2) {
-        s = s.slice(0, k);
-        continue;
-      }
+    const amp = trailingEntityAmp(s);
+    if (amp !== -1) {
+      s = s.slice(0, amp);
+      continue;
     }
     const last = s[s.length - 1];
-    // (b) trailing punctuation.
+    // Trailing punctuation.
     if ('?!.,:;*_~"\' '.indexOf(last) !== -1) {
       s = s.slice(0, -1);
       continue;
     }
-    // (c) trailing ')' that is not a group closer.
+    // Trailing ')' that is not a group closer.
     if (last === ')' && !closers.has(s.length - 1)) {
       s = s.slice(0, -1);
       continue;
@@ -1844,6 +1880,15 @@ function trimUrlCandidate(cand) {
 }
 
 const WWW_PRECEDING_OK = new Set([' ', '\t', '\n', '(', '*', '_', '~']);
+
+// Scan an email right after a scheme prefix ending at s (e.g. after
+// 'mailto:' or 'xmpp:'). Returns the end index of the email or -1.
+function scanSchemeEmail(text, s, trimTrailingUnderscore) {
+  const n = text.length;
+  const j = scanEmailLocal(text, s);
+  if (j === s || j >= n || text[j] !== '@') return -1;
+  return matchEmailDomain(text, j + 1, trimTrailingUnderscore);
+}
 
 // Match an extended autolink starting at text[i]. Returns
 // {href, text, end, extended} or null. Handles www., http(s)://, ftp://,
@@ -1881,20 +1926,10 @@ function matchExtendedUrl(text, i, trimTrailingUnderscore) {
     const prev = i === 0 ? '' : text[i - 1];
     if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
       // The email must start right after 'mailto:'.
-      let s = i + 7;
-      let j = s;
-      while (j < n) {
-        const c = text[j];
-        if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
-        else break;
-      }
-      if (j > s && j < n && text[j] === '@') {
-        const end = matchEmailDomain(text, j + 1, trimTrailingUnderscore);
-        if (end !== -1) {
-          const email = text.slice(s, end);
-          const full = 'mailto:' + email;
-          return { href: full, text: full, end, extended: true };
-        }
+      const end = scanSchemeEmail(text, i + 7, trimTrailingUnderscore);
+      if (end !== -1) {
+        const full = 'mailto:' + text.slice(i + 7, end);
+        return { href: full, text: full, end, extended: true };
       }
     }
     return null;
@@ -1905,31 +1940,22 @@ function matchExtendedUrl(text, i, trimTrailingUnderscore) {
   if (text.startsWith('xmpp:', i)) {
     const prev = i === 0 ? '' : text[i - 1];
     if (i === 0 || !(isAlpha(prev) || isDigit(prev))) {
-      let s = i + 5;
-      let j = s;
-      while (j < n) {
-        const c = text[j];
-        if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
-        else break;
-      }
-      if (j > s && j < n && text[j] === '@') {
-        const end = matchEmailDomain(text, j + 1, trimTrailingUnderscore);
-        if (end !== -1) {
-          let linkEnd = end;
-          if (end < n && text[end] === '/') {
-            let p = end + 1;
-            while (p < n) {
-              const c = text[p];
-              if (isAlpha(c) || isDigit(c) || c === '.' || c === '@') p++;
-              else break;
-            }
-            let pe = p;
-            while (pe > end + 1 && text[pe - 1] === '.') pe--;
-            if (pe > end + 1) linkEnd = pe;
+      const end = scanSchemeEmail(text, i + 5, trimTrailingUnderscore);
+      if (end !== -1) {
+        let linkEnd = end;
+        if (end < n && text[end] === '/') {
+          let p = end + 1;
+          while (p < n) {
+            const c = text[p];
+            if (isAlpha(c) || isDigit(c) || c === '.' || c === '@') p++;
+            else break;
           }
-          const full = text.slice(i, linkEnd);
-          return { href: full, text: full, end: linkEnd, extended: true };
+          let pe = p;
+          while (pe > end + 1 && text[pe - 1] === '.') pe--;
+          if (pe > end + 1) linkEnd = pe;
         }
+        const full = text.slice(i, linkEnd);
+        return { href: full, text: full, end: linkEnd, extended: true };
       }
     }
     return null;
@@ -1946,8 +1972,7 @@ function scanUrl(text, i) {
     if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '<') break;
     j++;
   }
-  const cand = text.slice(i, j);
-  const trimmed = trimUrlCandidate(cand);
+  const trimmed = trimUrlCandidate(text.slice(i, j));
   return trimmed === '' ? null : trimmed;
 }
 
@@ -1962,41 +1987,10 @@ function parseInlineLink(text, i) {
   let j = i + 1;
   while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
   if (j >= n) return null;
-  let dest = '';
-  if (text[j] === '<') {
-    j++;
-    let ok = false;
-    while (j < n) {
-      const c = text[j];
-      if (c === '\n' || c === '<') return null;
-      if (c === '>') { ok = true; j++; break; }
-      if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
-        dest += text[j + 1];
-        j += 2;
-      } else { dest += c; j++; }
-    }
-    if (!ok) return null;
-  } else {
-    let depth = 0;
-    while (j < n) {
-      const c = text[j];
-      if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
-        dest += text[j + 1];
-        j += 2;
-        continue;
-      }
-      if (c === '(') { depth++; dest += c; j++; continue; }
-      if (c === ')') {
-        if (depth === 0) break;
-        depth--; dest += c; j++; continue;
-      }
-      const code = c.charCodeAt(0);
-      if (c === ' ' || c === '\t' || c === '\n' || code < 0x20) break;
-      dest += c;
-      j++;
-    }
-    if (depth !== 0) return null;
-  }
+  const d = scanLinkDest(text, j, true);
+  if (!d) return null;
+  const dest = d.dest;
+  j = d.end;
   while (j < n && (text[j] === ' ' || text[j] === '\t' || text[j] === '\n')) j++;
   if (j >= n) return null;
   if (text[j] === ')') return { href: dest, title: null, end: j + 1 };
@@ -2014,21 +2008,7 @@ function parseInlineLink(text, i) {
 // Parse a reference label starting at text[i] ('[').
 // Returns {label, end} or null.
 function parseRefLabel(text, i) {
-  const n = text.length;
-  let j = i + 1;
-  let label = '';
-  while (j < n) {
-    const c = text[j];
-    if (c === '\\' && j + 1 < n && isAsciiPunct(text[j + 1])) {
-      // Escapes are kept RAW in the label (for matching).
-      label += text[j];
-      label += text[j + 1];
-      j += 2;
-    } else if (c === '[') return null;
-    else if (c === ']') return { label, end: j + 1 };
-    else { label += c; j++; }
-  }
-  return null;
+  return scanDefLabel(text, i + 1);
 }
 
 // Are the brackets in text[start..end) balanced (equal '[' and ']' counts,
@@ -2037,7 +2017,10 @@ function bracketsBalanced(text, start, end) {
   let depth = 0;
   for (let k = start; k < end; k++) {
     const c = text[k];
-    if (c === '\\' && k + 1 < end && isAsciiPunct(text[k + 1])) { k++; continue; }
+    if (c === '\\' && k + 1 < end && isAsciiPunct(text[k + 1])) {
+      k++;
+      continue;
+    }
     if (c === '[') depth++;
     else if (c === ']') {
       depth--;
@@ -2051,9 +2034,11 @@ function bracketsBalanced(text, start, end) {
 // Inline parser
 // ---------------------------------------------------------------------------
 
+// Flanking for a delimiter run covering text[start..end): whether it can
+// open (left-flanking) and/or close (right-flanking) emphasis, plus
+// whether the neighbors are punctuation. Start/end of the inline text
+// act like a newline (whitespace).
 function flanking(text, start, end) {
-  // Start/end of the inline text act like a newline (whitespace) for
-  // flanking purposes.
   const before = start > 0 ? text[start - 1] : '\n';
   const after = end < text.length ? text[end] : '\n';
   const beforeWs = isUnicodeWs(before);
@@ -2069,12 +2054,7 @@ function flanking(text, start, end) {
 // (Such underscores stay literal text so the email can form.)
 function underscoreInEmail(text, start) {
   const n = text.length;
-  let j = start;
-  while (j < n) {
-    const c = text[j];
-    if (isAlpha(c) || isDigit(c) || c === '.' || c === '_' || c === '+' || c === '-') j++;
-    else break;
-  }
+  const j = scanEmailLocal(text, start);
   if (j >= n || text[j] !== '@') return false;
   const em = matchEmail(text, j);
   return em !== null && em.start <= start;
@@ -2091,26 +2071,29 @@ function findTildeCloser(text, from, len) {
   let depth = 0;
   let i = from;
   while (i < n) {
-    if (text[i] === '\\' && i + 1 < n) { i += 2; continue; }
-    if (text[i] === '~') {
-      let j = i;
-      while (j < n && text[j] === '~') j++;
-      if (j - i === len) {
-        // Strikethrough uses the same flanking rules as emphasis: a run
-        // preceded by punctuation (e.g. an escaped '~') and followed by a
-        // letter can only open, not close.
-        const { left, right } = flanking(text, i, j);
-        const canClose = right;
-        const canOpen = left;
-        if (canClose) {
-          if (depth === 0) return i;
-          depth--;
-        } else if (canOpen) {
-          depth++;
-        }
+    if (text[i] === '\\' && i + 1 < n) {
+      i += 2;
+      continue;
+    }
+    if (text[i] !== '~') {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < n && text[j] === '~') j++;
+    if (j - i === len) {
+      // Strikethrough uses the same flanking rules as emphasis: a run
+      // preceded by punctuation (e.g. an escaped '~') and followed by a
+      // letter can only open, not close.
+      const { left, right } = flanking(text, i, j);
+      if (right) {
+        if (depth === 0) return i;
+        depth--;
+      } else if (left) {
+        depth++;
       }
-      i = j;
-    } else i++;
+    }
+    i = j;
   }
   return -1;
 }
