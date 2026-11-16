@@ -1274,6 +1274,19 @@ function endsWithOpenParagraph(blocks, lastLineBlank) {
 // Blockquotes and lists
 // ---------------------------------------------------------------------------
 
+// How a lazy setext-like line is transformed inside a blockquote:
+// after a '>' line it is kept as-is; after an unstripped lazy line it
+// is padded to 4 columns; after a stripped lazy line it is stripped
+// by 4. Returns {text, stripped}.
+function lazySetextLine(t, prevLazy, prevStripped) {
+  if (!prevLazy) return { text: t, stripped: false };
+  if (!prevStripped) {
+    const [w] = leadingWs(t);
+    return { text: ' '.repeat(Math.max(0, 4 - w)) + t, stripped: false };
+  }
+  return { text: stripIndent(t, 4), stripped: true };
+}
+
 // Consume a blockquote starting at lines[i].
 function consumeQuote(lines, i, refs) {
   const inner = [];
@@ -1314,17 +1327,11 @@ function consumeQuote(lines, i, refs) {
     const t = L.t;
     const [w] = leadingWs(t);
     if (matchSetext(t)) {
-      // A lazy setext-like line never becomes a setext underline. After an
-      // unstripped lazy line it is padded to 4 columns; after a stripped
-      // lazy line it is stripped by 4; after a '>' line it is kept as-is.
-      let out;
-      let stripped = false;
-      if (!prevLazy) out = t;
-      else if (!prevStripped) out = ' '.repeat(Math.max(0, 4 - w)) + t;
-      else { out = stripIndent(t, 4); stripped = true; }
-      inner.push({ t: out, nl: L.nl, noSetext: true, lazy: true });
+      // A lazy setext-like line never becomes a setext underline.
+      const sl = lazySetextLine(t, prevLazy, prevStripped);
+      inner.push({ t: sl.text, nl: L.nl, noSetext: true, lazy: true });
       prevLazy = true;
-      prevStripped = stripped;
+      prevStripped = sl.stripped;
     } else if (prevLazy && prevStripped && w < 4) {
       // A short lazy line after a stripped one: blank line first, kept as-is.
       insertBlank();
@@ -1347,6 +1354,38 @@ function consumeQuote(lines, i, refs) {
   return { block: { t: 'quote', children }, next: j };
 }
 
+// Do the collected item lines contain any non-blank line yet?
+function itemLinesHaveContent(itemLines) {
+  return itemLines.some((il) => !isBlankLine(il));
+}
+
+// While a fence is open with content, an under-indented line is fence
+// content — EXCEPT when the previous item line could start a leaf block:
+// 4+ columns of leading whitespace (indented code), an ATX heading, an
+// HR, or an HTML block. (List/blockquote markers do not break it.)
+function fenceCaptureBlocked(prev) {
+  if (!prev) return false;
+  const pt = prev.t;
+  const [pw] = leadingWs(pt);
+  if (pw >= 4) return true;
+  const ps = pt.slice(pw);
+  if (/^#{1,6}(?:[ \t]|$)/.test(ps)) return true;
+  if (/^(-{3,}|_{3,}|\*{3,})[ \t]*$/.test(ps)) return true;
+  if (/^(`{3,}|~{3,})/.test(ps)) return true;
+  if (matchHtmlBlock(pt) !== null) return true;
+  return false;
+}
+
+// Task list: if the first child is a paragraph starting with [x]/[ ]/[X]
+// + space/tab + content, strip the marker and return the task state.
+function extractTask(children) {
+  if (children.length === 0 || children[0].t !== 'p') return null;
+  const tm = /^\[([ xX])\][ \t]+(\S[\s\S]*)$/.exec(children[0].text);
+  if (!tm) return null;
+  children[0].text = tm[2];
+  return tm[1] === ' ' ? 'unchecked' : 'checked';
+}
+
 // Collect one list item starting at lines[j] (marker m). Returns
 // {item, next, loose}.
 function collectItem(lines, j, m, refs) {
@@ -1360,11 +1399,18 @@ function collectItem(lines, j, m, refs) {
   let fenceLen = 0;
   let fenceHasContent = false;
   const fm0 = matchFence(m.content);
-  if (fm0) { fenceCh = fm0.ch; fenceLen = fm0.len; }
+  if (fm0) {
+    fenceCh = fm0.ch;
+    fenceLen = fm0.len;
+  }
   function trackFence(stripped) {
     if (fenceCh === null) {
       const fm = matchFence(stripped);
-      if (fm) { fenceCh = fm.ch; fenceLen = fm.len; fenceHasContent = false; }
+      if (fm) {
+        fenceCh = fm.ch;
+        fenceLen = fm.len;
+        fenceHasContent = false;
+      }
     } else if (isClosingFence(stripped, fenceCh, fenceLen)) {
       fenceCh = null;
       fenceLen = 0;
@@ -1382,11 +1428,7 @@ function collectItem(lines, j, m, refs) {
       // ends here unless the next non-blank line is indented to the
       // content indent (a blank line breaks fence-content capture).
       // An item with no content yet ends at a blank line (it stays empty).
-      let hasContent = false;
-      for (const il of itemLines) {
-        if (!isBlankLine(il)) { hasContent = true; break; }
-      }
-      if (!hasContent) break;
+      if (!itemLinesHaveContent(itemLines)) break;
       let m2 = k + 1;
       while (m2 < lines.length && isBlankLine(lines[m2])) m2++;
       if (m2 >= lines.length) break;
@@ -1412,27 +1454,10 @@ function collectItem(lines, j, m, refs) {
     }
     // While a fence is open with content, an under-indented line that is
     // not itself a fence line is fence content (kept as-is). A fence line
-    // ends the item. Exception (marked quirk): when the previous item
-    // line could start a leaf block — 4+ columns of leading whitespace
-    // (indented code), an ATX heading, an HR, or an HTML block — the
-    // under-indented line is NOT captured; the item (and the fence)
-    // ends there instead. List/blockquote markers do not break it.
+    // ends the item. (See fenceCaptureBlocked for the leaf-block exception.)
     if (fenceCh !== null && fenceHasContent && matchFence(t) === null) {
       const prev = itemLines[itemLines.length - 1];
-      let blocksCapture = false;
-      if (prev) {
-        const pt = prev.t;
-        const [pw] = leadingWs(pt);
-        if (pw >= 4) blocksCapture = true;
-        else {
-          const ps = pt.slice(pw);
-          if (/^#{1,6}(?:[ \t]|$)/.test(ps)) blocksCapture = true;
-          else if (/^(-{3,}|_{3,}|\*{3,})[ \t]*$/.test(ps)) blocksCapture = true;
-          else if (/^(`{3,}|~{3,})/.test(ps)) blocksCapture = true;
-          else if (matchHtmlBlock(pt) !== null) blocksCapture = true;
-        }
-      }
-      if (!blocksCapture) {
+      if (!fenceCaptureBlocked(prev)) {
         itemLines.push({ t, nl: L.nl });
         k++;
         needCheck = true;
@@ -1460,20 +1485,19 @@ function collectItem(lines, j, m, refs) {
   // Item looseness: a blank line DIRECTLY between two top-level children
   // (blank lines inside a nested block do not count).
   const itemLoose = children.hasBlankBetween === true;
-  // Task list: first paragraph starting with [x]/[ ]/[X] + space/tab + content.
-  let task = null;
-  if (children.length > 0 && children[0].t === 'p') {
-    const tm = /^\[([ xX])\][ \t]+(\S[\s\S]*)$/.exec(children[0].text);
-    if (tm) {
-      task = tm[1] === ' ' ? 'unchecked' : 'checked';
-      children[0].text = tm[2];
-    }
-  }
+  const task = extractTask(children);
   return {
     item: { t: 'item', children, task, contentIndent },
     next: k,
     loose: itemLoose,
   };
+}
+
+// Does this marker belong to the list (same kind/delimiter, indent below
+// the previous item's content indent)? Items need not share one indent.
+function markerBelongsToList(m, ordered, delim, prevContentIndent) {
+  return m !== null && m.indent < prevContentIndent &&
+    m.ordered === ordered && m.delim === delim;
 }
 
 // Consume a list starting at lines[i] (first marker already matched).
@@ -1495,7 +1519,8 @@ function consumeList(lines, i, refs) {
       while (k < lines.length && isBlankLine(lines[k])) k++;
       if (k >= lines.length) break;
       const nm = matchListMarker(lines[k].t);
-      if (nm && !matchHR(lines[k].t) && nm.indent < prevContentIndent && nm.ordered === ordered && nm.delim === delim) {
+      if (nm && !matchHR(lines[k].t) &&
+          markerBelongsToList(nm, ordered, delim, prevContentIndent)) {
         loose = true;
         j = k;
         continue;
@@ -1506,7 +1531,7 @@ function consumeList(lines, i, refs) {
     // is an <hr>, never a new item.
     if (matchHR(L.t)) break;
     const m = matchListMarker(L.t);
-    if (m && m.indent < prevContentIndent && m.ordered === ordered && m.delim === delim) {
+    if (markerBelongsToList(m, ordered, delim, prevContentIndent)) {
       const res = collectItem(lines, j, m, refs);
       items.push(res.item);
       if (res.loose) loose = true;
@@ -1537,6 +1562,17 @@ function parseBlocks(lines, refs, inListItem) {
     blankSinceLastBlock = false;
     blocks.push(b);
   }
+  // Consume a paragraph at lines[at] and push its blocks, tracking the
+  // blank-between state for looseness. Returns the next line index.
+  function consumeParaAt(at) {
+    const r = consumeParagraph(lines, at, refs, inListItem);
+    for (const b of r.blocks) pushBlock(b);
+    if (r.blocks.length === 0 && blankSinceLastBlock) {
+      blocks.hasBlankBetween = true;
+      blankSinceLastBlock = false;
+    }
+    return r.next;
+  }
   while (i < n) {
     const L = lines[i];
     if (isBlankLine(L) || isBlankStart(L.t)) {
@@ -1548,13 +1584,7 @@ function parseBlocks(lines, refs, inListItem) {
     // A lazy continuation line is paragraph text, never a new block
     // (even if stripping made it look like a list marker or heading).
     if (L.lazy) {
-      const r = consumeParagraph(lines, i, refs, inListItem);
-      for (const b of r.blocks) pushBlock(b);
-      if (r.blocks.length === 0 && blankSinceLastBlock) {
-        blocks.hasBlankBetween = true;
-        blankSinceLastBlock = false;
-      }
-      i = r.next;
+      i = consumeParaAt(i);
       continue;
     }
     let m = matchFence(t);
@@ -1602,13 +1632,7 @@ function parseBlocks(lines, refs, inListItem) {
       i = r.next;
       continue;
     }
-    const r = consumeParagraph(lines, i, refs, inListItem);
-    for (const b of r.blocks) pushBlock(b);
-    if (r.blocks.length === 0 && blankSinceLastBlock) {
-      blocks.hasBlankBetween = true;
-      blankSinceLastBlock = false;
-    }
-    i = r.next;
+    i = consumeParaAt(i);
   }
   return blocks;
 }
