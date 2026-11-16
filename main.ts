@@ -7,25 +7,37 @@
 // MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
 // /output.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-type Case = { id: string; markdown: string };
+type InputCase = { id: string; markdown: string };
 
-function loadCases(): Case[] {
-  const raw = readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8');
-  return JSON.parse(raw) as Case[];
+async function readCases(): Promise<InputCase[]> {
+  const raw = await readFile(join(INPUT_DIR, 'cases.json'), 'utf8');
+  const parsed: unknown = JSON.parse(raw);
+  return parsed as InputCase[];
 }
 
-function main(): void {
-  const cases = loadCases();
-  // Render each case independently; parse() keeps no state between calls.
-  const html = cases.map((c) => parse(c.markdown));
-  writeFileSync(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
+async function writeOutputs(html: string[]): Promise<void> {
+  await mkdir(OUTPUT_DIR, { recursive: true });
+  await writeFile(join(OUTPUT_DIR, 'html.json'), JSON.stringify(html));
 }
 
-main();
+async function run(): Promise<void> {
+  const cases = await readCases();
+  const html: string[] = [];
+  for (const c of cases) {
+    // Render each case independently; parse() keeps no state between calls.
+    html.push(parse(c.markdown));
+  }
+  await writeOutputs(html);
+}
+
+run().catch((err: unknown) => {
+  console.error(err);
+  process.exit(1);
+});

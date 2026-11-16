@@ -55,6 +55,77 @@ single-pass inline walk, cheap character-class checks (code-point ranges
 instead of regexes on the hot path), and rendering straight into a chunk
 array instead of building an AST.
 
+## Tooling
+
+Two scripts ship alongside the parser (both plain Node, no dependencies):
+
+- `benchmark.mjs` — times `parse()` against the kit's vendored marked
+  18.1.3 over the 720 practice cases. It checks correctness first (every
+  case must be byte-identical to marked's output, or it exits 1), then
+  runs warmup + timed passes and reports median/min/max/p95 per engine,
+  the speedup, and the five slowest cases. Flags: `--runs N` (timed
+  passes, default 5), `--warmup N`, `--cases <path>` (a cases.json to
+  use instead of the kit's), `--marked <path>` (the marked module to
+  compare against), `--json` (machine-readable report), `--report
+  <path>` (write the JSON report to a file). The kit directory is taken
+  from `MAKEFUN_KIT_DIR` when set, else `../markdown-render-speed-02-kit`
+  relative to this repo.
+- `fuzz.mjs` — a seeded deterministic fuzzer. It builds random markdown
+  documents from fragment pools (plain words, inline markup, block
+  constructs, punctuation soup) with a mulberry32 PRNG, then checks that
+  `parse()` never throws, always returns a string, and is deterministic
+  (same input rendered twice gives the same output). Flags: `--seed N`,
+  `--count N`, `--compare N` (render the first N docs with marked too
+  and count mismatches — informational only, since random soup hits
+  edges outside the practice set), `--max-lines N`, `--verbose`.
+
+```sh
+node benchmark.mjs --runs 5
+node fuzz.mjs --seed 7 --count 300 --compare 100
+```
+
+## Design notes
+
+A few choices shape the whole parser:
+
+- **Lines carry their newline.** Every source line remembers whether a
+  newline followed it. That single bit settles several marked quirks at
+  once: a final unterminated whitespace-only line is content, not blank;
+  HTML blocks get their trailing newline only under the right conditions;
+  a terminated `   \t` line is a table body row, not a blank.
+- **Lazy lines are flagged, not re-parsed.** Blockquote and list-item
+  collection marks continuation lines as lazy (and, where relevant, as
+  never-a-table or never-a-setext). The paragraph consumer then treats
+  them as plain text, which is exactly how marked treats them — no
+  second-guessing at the inline level.
+- **Emphasis resolves in two passes.** The inline walk first collects
+  chunks and records every `*`/`_` delimiter run with its flanking
+  information; a separate resolution pass then pairs openers and closers
+  with the CommonMark rules (including the rule of 3, the intraword
+  `_` restriction, and the odd/even length interplay between `*` and
+  `_`). Keeping tokenization and resolution apart is what makes the
+  `*write quote **uses 2*3*4**`-class inputs tractable at all.
+- **Delimiters are data, not regexes.** Character classes (punctuation,
+  whitespace, word characters) are code-point range checks, and the hot
+  inline loop dispatches on single characters. Regexes appear only where
+  a pattern is genuinely irregular (delimiter rows, task markers, email
+  domains) and never inside a per-character loop.
+- **No AST for inline content.** Inline parsing renders straight into a
+  chunk array that is joined once at the end. Blocks are the only tree,
+  and it is shallow: paragraphs, headings, code, quotes, lists, tables.
+
+## Testing
+
+- Practice set: the kit's harness renders all 720 cases with this
+  parser and with marked and diffs them byte for byte. Target: 720/720.
+- End-to-end: run `main.ts` against the practice cases with
+  `MAKEFUN_INPUT_DIR` / `MAKEFUN_OUTPUT_DIR` set, then compare the
+  produced `html.json` against marked's — same 720/720 target.
+- Fuzzing: `node fuzz.mjs` with several seeds; zero crashes and zero
+  nondeterminism are the bar. Mismatches against marked on random soup
+  are logged for triage, not treated as failures — the practice set is
+  the contract.
+
 ## Run it
 
 ```sh
