@@ -2108,10 +2108,16 @@ function parseInline(text, refs, plain) {
         flushText(i);
         const chunkIdx = chunks.length;
         pushChunk(text.slice(i, j), i);
+        // The backtick-link emphasis suppression does not apply inside
+        // a bracket (link text is tokenized in its own scope).
+        let inBracket = false;
+        for (let b = brackets.length - 1; b >= 0; b--) {
+          if (brackets[b].active) { inBracket = true; break; }
+        }
         delims.push({
           chunk: chunkIdx, ch: c, len: runLen, canOpen, canClose,
           scope: 0, openTags: [], closeTags: [],
-          dead: suppressEmUntilTick,
+          dead: suppressEmUntilTick && !inBracket,
         });
         i = j;
         textStart = i;
