@@ -1268,6 +1268,7 @@ function collectItem(lines, j, m, refs) {
           const ps = pt.slice(pw);
           if (/^#{1,6}(?:[ \t]|$)/.test(ps)) blocksCapture = true;
           else if (/^(-{3,}|_{3,}|\*{3,})[ \t]*$/.test(ps)) blocksCapture = true;
+          else if (/^(`{3,}|~{3,})/.test(ps)) blocksCapture = true;
           else if (matchHtmlBlock(pt) !== null) blocksCapture = true;
         }
       }
