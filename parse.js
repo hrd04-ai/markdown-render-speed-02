@@ -3323,9 +3323,21 @@ function parseInline(text, refs, plain) {
 // The task-list checkbox HTML for a list item, or '' when this is not a
 // task item or not the first child.
 function taskCheckbox(item, isFirst) {
-  if (!isFirst || !item.task) return '';
+  if (!isFirst) return '';
+  if (!item.task) return '';
   const checked = item.task === 'checked' ? 'checked="" ' : '';
   return `<input ${checked}disabled="" type="checkbox"> `;
+}
+
+// Render one paragraph child of a list item: task checkbox (first child
+// only) + inline content, wrapped in <p> when the list is loose.
+function renderItemParagraph(item, ci, ch, loose, refs, out) {
+  const inner = taskCheckbox(item, ci === 0) + parseInline(ch.text, refs, false);
+  if (loose) {
+    out.push('<p>', inner, '</p>\n');
+    return;
+  }
+  out.push(inner);
 }
 
 function renderItem(item, loose, refs, out) {
@@ -3337,26 +3349,26 @@ function renderItem(item, loose, refs, out) {
   }
   for (let ci = 0; ci < children.length; ci++) {
     const ch = children[ci];
-    if (ch.t !== 'p') {
+    if (ch.t === 'p') {
+      renderItemParagraph(item, ci, ch, loose, refs, out);
+    } else {
       renderBlocks([ch], refs, out);
-      continue;
     }
-    const inner = taskCheckbox(item, ci === 0) + parseInline(ch.text, refs, false);
-    if (loose) out.push('<p>', inner, '</p>\n');
-    else out.push(inner);
   }
   out.push('</li>\n');
+}
+
+// Render one table cell (header or body): alignment attribute + inline
+// content.
+function renderTableCell(tag, align, text, refs, out) {
+  const attr = align ? ` align="${align}"` : '';
+  out.push(`<${tag}${attr}>`, parseInline(text, refs, false), `</${tag}>\n`);
 }
 
 function renderTable(b, refs, out) {
   out.push('<table>\n<thead>\n<tr>\n');
   for (let ci = 0; ci < b.head.length; ci++) {
-    const al = b.align[ci];
-    out.push(
-      `<th${al ? ` align="${al}"` : ''}>`,
-      parseInline(b.head[ci], refs, false),
-      '</th>\n',
-    );
+    renderTableCell('th', b.align[ci], b.head[ci], refs, out);
   }
   out.push('</tr>\n</thead>\n');
   if (b.body.length > 0) {
@@ -3364,12 +3376,7 @@ function renderTable(b, refs, out) {
     for (const row of b.body) {
       out.push('<tr>\n');
       for (let ci = 0; ci < row.length; ci++) {
-        const al = b.align[ci];
-        out.push(
-          `<td${al ? ` align="${al}"` : ''}>`,
-          parseInline(row[ci], refs, false),
-          '</td>\n',
-        );
+        renderTableCell('td', b.align[ci], row[ci], refs, out);
       }
       out.push('</tr>\n');
     }
@@ -3378,48 +3385,50 @@ function renderTable(b, refs, out) {
   out.push('</table>\n');
 }
 
+// Render one block of each type. Each renderer takes (block, refs, out).
+const BLOCK_RENDERERS = {
+  p(b, refs, out) {
+    out.push('<p>', parseInline(b.text, refs, false), '</p>\n');
+  },
+  h(b, refs, out) {
+    out.push(`<h${b.level}>`, parseInline(b.text, refs, false), `</h${b.level}>\n`);
+  },
+  code(b, refs, out) {
+    out.push('<pre><code>', escapeText(b.text), '</code></pre>\n');
+  },
+  fence(b, refs, out) {
+    const cls = b.lang !== ''
+      ? ` class="language-${escapeNoEncode(b.lang)}"`
+      : '';
+    out.push(`<pre><code${cls}>`, escapeText(b.text), '</code></pre>\n');
+  },
+  hr(b, refs, out) {
+    out.push('<hr>\n');
+  },
+  html(b, refs, out) {
+    out.push(b.text);
+  },
+  quote(b, refs, out) {
+    out.push('<blockquote>\n');
+    renderBlocks(b.children, refs, out);
+    out.push('</blockquote>\n');
+  },
+  list(b, refs, out) {
+    const tag = b.ordered ? 'ol' : 'ul';
+    const startAttr = b.ordered && b.start !== 1 ? ` start="${b.start}"` : '';
+    out.push(`<${tag}${startAttr}>\n`);
+    for (const it of b.items) renderItem(it, b.loose, refs, out);
+    out.push(`</${tag}>\n`);
+  },
+  table(b, refs, out) {
+    renderTable(b, refs, out);
+  },
+};
+
 function renderBlocks(blocks, refs, out) {
   for (const b of blocks) {
-    switch (b.t) {
-      case 'p':
-        out.push('<p>', parseInline(b.text, refs, false), '</p>\n');
-        break;
-      case 'h':
-        out.push(`<h${b.level}>`, parseInline(b.text, refs, false), `</h${b.level}>\n`);
-        break;
-      case 'code':
-        out.push('<pre><code>', escapeText(b.text), '</code></pre>\n');
-        break;
-      case 'fence': {
-        const cls = b.lang !== ''
-          ? ` class="language-${escapeNoEncode(b.lang)}"`
-          : '';
-        out.push(`<pre><code${cls}>`, escapeText(b.text), '</code></pre>\n');
-        break;
-      }
-      case 'hr':
-        out.push('<hr>\n');
-        break;
-      case 'html':
-        out.push(b.text);
-        break;
-      case 'quote':
-        out.push('<blockquote>\n');
-        renderBlocks(b.children, refs, out);
-        out.push('</blockquote>\n');
-        break;
-      case 'list': {
-        const tag = b.ordered ? 'ol' : 'ul';
-        const startAttr = b.ordered && b.start !== 1 ? ` start="${b.start}"` : '';
-        out.push(`<${tag}${startAttr}>\n`);
-        for (const it of b.items) renderItem(it, b.loose, refs, out);
-        out.push(`</${tag}>\n`);
-        break;
-      }
-      case 'table':
-        renderTable(b, refs, out);
-        break;
-    }
+    const render = BLOCK_RENDERERS[b.t];
+    if (render) render(b, refs, out);
   }
 }
 
@@ -3431,13 +3440,19 @@ function renderBlocks(blocks, refs, out) {
 // module-level inline state (in-link flag, link/autolink tracking) is
 // reset on every call so parses are independent.
 export function parse(markdown) {
-  inLinkGlobal = false;
-  linksFormed = 0;
-  extAutolinks = [];
+  resetInlineState();
   const lines = splitLines(markdown);
   const refs = new Map();
   const blocks = parseBlocks(lines, refs);
   const out = [];
   renderBlocks(blocks, refs, out);
   return out.join('');
+}
+
+// Reset the module-level inline state so one parse() call cannot leak
+// into the next (in-link flag, link/autolink tracking).
+function resetInlineState() {
+  inLinkGlobal = false;
+  linksFormed = 0;
+  extAutolinks = [];
 }
